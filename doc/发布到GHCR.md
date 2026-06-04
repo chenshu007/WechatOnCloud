@@ -1,8 +1,8 @@
-# 发布到 GHCR
+# 发布镜像
 
 > 返回 [← README](../README.md)
 
-把两个镜像（`woc-panel`、`wechat-on-cloud`）发布到 GitHub Container Registry，供他人 `docker compose up -d` 直接拉取。两种方式任选其一。
+把两个镜像（`woc-panel`、`wechat-on-cloud`）发布到容器仓库，供他人 `docker compose up -d` 直接拉取。默认走 GHCR；可选同步推到 Docker Hub。
 
 ---
 
@@ -18,6 +18,26 @@ gh release create v1.0.0 --title v1.0.0 --notes "..."
 ```
 
 > 注意：单纯 push tag 只产出 `X.Y.Z / X.Y / X`，**不会更新 `latest`**；要更新 `latest` 请改用 **发布 Release** 或在 Actions 里手动 `workflow_dispatch`。
+
+### 可选：同步推到 Docker Hub
+
+GHCR 拉取在国际网络下偶尔被 TLS / DNS 干扰；Docker Hub 覆盖面更广，且公开镜像 `docker pull` 无需先 `docker login`。workflow 已内置 Docker Hub 双推开关：**配齐两个变量即可启用，没配就保持只推 GHCR**（向后兼容）。
+
+**一次性配置**（GitHub repo → Settings → Secrets and variables → Actions）：
+
+| 类型 | Name | Value |
+|---|---|---|
+| Variable | `DOCKERHUB_USERNAME` | 你的 Docker Hub 用户名（如 `gloridust`） |
+| Secret | `DOCKERHUB_TOKEN` | Docker Hub Access Token（[hub.docker.com → Account Settings → Personal access tokens](https://hub.docker.com/settings/personal-access-tokens) → New Access Token，权限选 `Read & Write`） |
+
+> Variable 和 Secret 是两个不同的 tab；用户名放 Variable 即可（不敏感），Token 必须放 Secret。
+> 在 Docker Hub 上**预先建好两个 public repo**：`<用户名>/woc-panel`、`<用户名>/wechat-on-cloud`（hub.docker.com → Create Repository），否则首次推送会失败（Docker Hub 不会自动建 repo）。
+
+配齐后，下次发版（或 `workflow_dispatch` 手动触发）就会同时推到：
+- `ghcr.io/<github-owner>/woc-panel:X.Y.Z`
+- `docker.io/<dockerhub-user>/woc-panel:X.Y.Z`
+
+使用者在 `.env` 里 `WOC_IMAGE_PREFIX=docker.io/<dockerhub-user>` 即可从 Docker Hub 拉。
 
 ---
 

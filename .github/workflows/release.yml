@@ -50,11 +50,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 可选：同时推 Docker Hub。仅当仓库设置里加了 vars.DOCKERHUB_USERNAME 时启用，
+      # 让 fork 用户开箱即可走 GHCR；想加 Docker Hub 双推只需配 1 个 Variable + 1 个 Secret。
+      # 配置方法：repo Settings → Secrets and variables → Actions：
+      #   · Variables → DOCKERHUB_USERNAME = 你的 Docker Hub 用户名
+      #   · Secrets   → DOCKERHUB_TOKEN    = Docker Hub Access Token（hub.docker.com → Account Settings → Personal access tokens）
+      - name: Log in to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Docker metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          # metadata-action 接受多行 images：每行一个目标 registry，build-push-action 会同时推。
+          # Docker Hub 那行只在配了 DOCKERHUB_USERNAME 时出现；否则只剩 GHCR 一行（与旧行为一致）。
+          images: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+            ${{ vars.DOCKERHUB_USERNAME != '' && format('docker.io/{0}/{1}', vars.DOCKERHUB_USERNAME, matrix.image) || '' }}
           # 语义化标签：vX.Y.Z → X.Y.Z / X.Y / X；默认分支额外打 latest
           tags: |
             type=semver,pattern={{version}}

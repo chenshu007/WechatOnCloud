@@ -138,6 +138,25 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     // 「重新连接」按钮与「重启实例」后的重连同样走整页重载（见 restartInstance / 桌面无响应面板）。
     window.location.reload();
   };
+  // 麦克风开关（默认关）：默认不抢占麦克风，避免一打开实例就把 AirPods 切到低质通话模式；需要语音/通话时再开。
+  // 扬声器（听实例声音）始终可用、不受此开关影响。
+  const [micOn, setMicOn] = useState(() => {
+    try {
+      return window.localStorage.getItem('woc_mic_enabled') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleMic = () => {
+    const v = !micOn;
+    setMicOn(v);
+    try {
+      window.localStorage.setItem('woc_mic_enabled', v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+    audioRef.current?.setMicEnabled(v);
+  };
   const [imeText, setImeText] = useState('');
   const [imeSending, setImeSending] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -320,7 +339,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
   useEffect(() => {
     if (!showVnc || !id) return;
-    const audio = new VncAudio(id);
+    const audio = new VncAudio(id, micOn);
     audioRef.current = audio;
     audio.connect();
     const isFocused = () => !document.hidden && document.hasFocus();
@@ -679,6 +698,17 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               onClick={() => setShowClip((v) => !v)}
             >
               剪贴板
+            </button>
+            <button
+              className={'ws-action' + (micOn ? ' on' : '')}
+              title={
+                micOn
+                  ? '麦克风已开：占用本机麦克风（AirPods 等可能被切到低音质通话模式）。点击关闭'
+                  : '麦克风已关：不占用麦克风，AirPods 保持高音质输出。需要语音/通话时点此开启'
+              }
+              onClick={toggleMic}
+            >
+              麦克风：{micOn ? '开' : '关'}
             </button>
             {isAdmin && (
               <button className="ws-action" title="重启实例（修复卡死/最小化丢失）" onClick={restartInstance}>

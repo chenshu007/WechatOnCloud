@@ -123,9 +123,19 @@ export class VncAudio {
   private micSource: MediaStreamAudioSourceNode | null = null;
   private gestureBound = false;
   private destroyed = false;
+  private micEnabled = false; // 麦克风默认关：避免一打开实例就 getUserMedia 抢占麦克风（会把 AirPods 切到低质通话模式）
 
-  constructor(id: string) {
+  constructor(id: string, micEnabled = false) {
     this.id = id;
+    this.micEnabled = micEnabled;
+  }
+
+  // 麦克风开关：关 → 释放麦克风（AirPods 回到高质输出）；开且本实例在焦点 → 采集并上传。扬声器不受影响。
+  setMicEnabled(on: boolean) {
+    if (this.destroyed) return;
+    this.micEnabled = on;
+    if (on && this.active) this.startMic();
+    else this.stopMic();
   }
 
   // 建立 socket 连接（不自动出声，由 setActive 控制）。
@@ -204,6 +214,7 @@ export class VncAudio {
   }
 
   private async startMic() {
+    if (!this.micEnabled) return; // 麦克风开关关闭：不 getUserMedia、不抢占麦克风
     // 麦克风需安全上下文（HTTPS / localhost）；http 局域网下静默跳过，只保留扬声器。
     if (this.micCtx || !this.socket) return;
     const md = navigator.mediaDevices;

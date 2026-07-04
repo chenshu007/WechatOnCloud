@@ -134,12 +134,20 @@ async function rawUpload(url: string, file: File): Promise<any> {
 }
 
 async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
-  // 仅在有 body 时声明 JSON content-type：否则 Fastify 对「空 body + application/json」会报 400
-  const headers = opts.body ? { 'content-type': 'application/json', ...opts.headers } : opts.headers;
+  const method = String(opts.method || 'GET').toUpperCase();
+  const headers = new Headers(opts.headers);
+  let body = opts.body;
+  if (body == null && method !== 'GET' && method !== 'HEAD') {
+    body = '{}';
+  }
+  if (body != null && !headers.has('content-type')) {
+    headers.set('content-type', 'application/json');
+  }
   const res = await apiFetch(path, {
     credentials: 'same-origin',
     ...opts,
     headers,
+    body,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {

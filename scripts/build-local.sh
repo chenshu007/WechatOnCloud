@@ -14,6 +14,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # 烤进面板镜像的版本号：设了 WOC_VERSION 就用它（如 v1.2.0），否则用 dev-<短SHA>（本地构建标识）。
 # 开发版不是正式发布版，面板「关于」会标「开发版」、不会触发「有新版」红点。
 VER="${WOC_VERSION:-dev-$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo local)}"
+REVISION="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
 
 PANEL_IMAGE="ghcr.io/${OWNER}/woc-panel:${TAG}"
 WECHAT_IMAGE="ghcr.io/${OWNER}/wechat-on-cloud:${TAG}"
@@ -23,7 +24,7 @@ WECHAT_IMAGE="ghcr.io/${OWNER}/wechat-on-cloud:${TAG}"
 # dockerode）解析 :tag 时不会跟到新 manifest list、仍指向同名旧镜像 → 重建实例还是用旧镜像（实测踩过）。
 # 面板靠 dockerode 跑实例，故实例镜像尤其必须用这俩参数。
 echo "==> 构建面板镜像 ${PANEL_IMAGE} （版本号 ${VER}）"
-docker build --provenance=false --sbom=false --build-arg "WOC_VERSION=${VER}" -t "${PANEL_IMAGE}" "${ROOT}/panel"
+docker build --provenance=false --sbom=false --build-arg "WOC_VERSION=${VER}" --build-arg "WOC_BUILD_REVISION=${REVISION}" -t "${PANEL_IMAGE}" "${ROOT}/panel"
 
 echo "==> 构建微信实例镜像 ${WECHAT_IMAGE}"
 docker build --provenance=false --sbom=false -t "${WECHAT_IMAGE}" "${ROOT}/docker"

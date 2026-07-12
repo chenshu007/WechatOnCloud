@@ -96,7 +96,9 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           # 仅面板镜像消费 WOC_VERSION（实例镜像不展示版本号），避免「未使用的 build-arg」告警。
-          build-args: ${{ matrix.name == 'panel' && format('WOC_VERSION={0}', steps.ver.outputs.version) || '' }}
+          build-args: |
+            ${{ matrix.name == 'panel' && format('WOC_VERSION={0}', steps.ver.outputs.version) || '' }}
+            ${{ matrix.name == 'panel' && format('WOC_BUILD_REVISION={0}', github.sha) || '' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

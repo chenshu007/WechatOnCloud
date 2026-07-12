@@ -4,9 +4,11 @@
 // 全程 best-effort：离线 / 被墙 / 私有源拉取失败时不报错、不打扰，仅不显示红点（记 error 供「上次检查」提示）。
 
 export const CURRENT_VERSION = (process.env.WOC_VERSION || 'dev').trim();
+export const BUILD_REVISION = (process.env.WOC_BUILD_REVISION || '').trim();
 
 export interface VersionInfo {
   current: string; // 当前构建版本（如 v1.2.0 / dev-<sha>）
+  revision: string | null; // 构建所对应的 Git SHA（旧镜像可能为 null）
   latest: string | null; // 仓库上最新发布版（如 v1.2.1）；查不到为 null
   hasUpdate: boolean; // 有可升级目标时为 true（正式版：latest>current；开发版：查到任一正式版即可"升级到正式版"）
   isDev: boolean; // 当前不是正式语义化版本（如 dev-<sha> 本地/自构建版）
@@ -68,7 +70,7 @@ async function ghcrTags(owner: string): Promise<string[]> {
 // 当前是否为"开发版"（非正式 vX.Y.Z，如本地/自构建的 dev-<sha>）。开发版允许一键"升级到正式版"。
 const IS_DEV = !parseSemver(CURRENT_VERSION);
 
-let cache: VersionInfo = { current: CURRENT_VERSION, latest: null, hasUpdate: false, isDev: IS_DEV, checkedAt: 0, source: null, error: null };
+let cache: VersionInfo = { current: CURRENT_VERSION, revision: BUILD_REVISION || null, latest: null, hasUpdate: false, isDev: IS_DEV, checkedAt: 0, source: null, error: null };
 let inflight: Promise<VersionInfo> | null = null;
 
 export function versionInfo(): VersionInfo {
@@ -98,6 +100,7 @@ export function checkForUpdate(): Promise<VersionInfo> {
     const hasUpdate = IS_DEV ? !!latestV : !!(latestV && cur && cmpSemver(latestV, cur) > 0);
     cache = {
       current: CURRENT_VERSION,
+      revision: BUILD_REVISION || null,
       latest: latestBare ? `v${latestBare}` : null,
       hasUpdate,
       isDev: IS_DEV,

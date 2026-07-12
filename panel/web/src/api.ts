@@ -77,6 +77,7 @@ export interface VolEntry {
 
 export interface VersionInfo {
   current: string; // 当前构建版本（如 v1.2.0 / dev-<sha>）
+  revision: string | null; // 构建对应的 Git SHA（旧镜像可能为 null）
   latest: string | null; // 仓库上最新发布版（如 v1.2.1）；查不到为 null
   hasUpdate: boolean; // 有可升级目标（正式版：latest>current；开发版：查到任一正式版）
   isDev: boolean; // 当前是开发版（非正式 vX.Y.Z）
@@ -85,8 +86,16 @@ export interface VersionInfo {
   error: string | null; // 检查失败原因
 }
 
-const ACCESS_REAUTH_TS = 'woc_access_reauth_ts';
+const ACCESS_REAUTH_STATE = 'woc_access_reauth_state';
 const ACCESS_REAUTH_MESSAGE = '访问会话已失效，正在重新验证…';
+const ACCESS_REAUTH_WINDOW_MS = 60_000;
+const ACCESS_REAUTH_COOLDOWN_MS = 8_000;
+const ACCESS_REAUTH_MAX_ATTEMPTS = 2;
+
+interface AccessReauthState {
+  attempts: number;
+  lastAttemptAt: number;
+}
 
 function isSameOriginApi(input: RequestInfo | URL) {
   const url = typeof input === 'string' || input instanceof URL ? input.toString() : input.url;
@@ -94,13 +103,46 @@ function isSameOriginApi(input: RequestInfo | URL) {
   return parsed.origin === window.location.origin && parsed.pathname.startsWith('/api/');
 }
 
-function redirectForAccessReauth() {
-  if (!navigator.onLine) return false;
+function readAccessReauthState(now: number): AccessReauthState {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(ACCESS_REAUTH_STATE) || '{}') as Partial<AccessReauthState>;
+    const lastAttemptAt = Number(parsed.lastAttemptAt || 0);
+    if (!lastAttemptAt || now - lastAttemptAt > ACCESS_REAUTH_WINDOW_MS) {
+      return { attempts: 0, lastAttemptAt: 0 };
+    }
+    return { attempts: Number(parsed.attempts || 0), lastAttemptAt };
+  } catch {
+    return { attempts: 0, lastAttemptAt: 0 };
+  }
+}
+
+function clearAccessReauthState() {
+  try {
+    sessionStorage.removeItem(ACCESS_REAUTH_STATE);
+  } catch {}
+  const url = new URL(window.location.href);
+  if (url.searchParams.delete('woc_access_reauth')) {
+    window.history.replaceState(window.history.state, '', url.toString());
+  }
+}
+
+function isAbortError(err: unknown) {
+  return typeof err === 'object' && err !== null && 'name' in err && (err as { name?: string }).name === 'AbortError';
+}
+
+function redirectForAccessReauth(err: unknown) {
+  if (!(err instanceof TypeError) || isAbortError(err) || !navigator.onLine || document.visibilityState === 'hidden') {
+    return false;
+  }
 
   const now = Date.now();
-  const last = Number(sessionStorage.getItem(ACCESS_REAUTH_TS) || 0);
-  if (now - last < 8000) return false;
-  sessionStorage.setItem(ACCESS_REAUTH_TS, String(now));
+  const state = readAccessReauthState(now);
+  if (state.attempts >= ACCESS_REAUTH_MAX_ATTEMPTS || now - state.lastAttemptAt < ACCESS_REAUTH_COOLDOWN_MS) {
+    return false;
+  }
+  try {
+    sessionStorage.setItem(ACCESS_REAUTH_STATE, JSON.stringify({ attempts: state.attempts + 1, lastAttemptAt: now }));
+  } catch {}
 
   // Fetch cannot follow Cloudflare Access' cross-origin login redirect because the browser
   // blocks it as CORS. A top-level navigation lets Access re-authenticate and then return here.
@@ -112,9 +154,11 @@ function redirectForAccessReauth() {
 
 async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   try {
-    return await fetch(input, init);
+    const response = await fetch(input, init);
+    clearAccessReauthState();
+    return response;
   } catch (err) {
-    if (isSameOriginApi(input) && redirectForAccessReauth()) {
+    if (isSameOriginApi(input) && redirectForAccessReauth(err)) {
       throw new Error(ACCESS_REAUTH_MESSAGE);
     }
     throw err;

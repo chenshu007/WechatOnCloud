@@ -5,7 +5,6 @@ import httpProxy from 'http-proxy';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
-import type { ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import {
   initStore,
@@ -89,7 +88,7 @@ import {
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions, SESSION_TTL_MS } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
-import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
+import { BUILD_REVISION, CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
@@ -166,6 +165,9 @@ function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
 }
 
 // ---------- 登录 / 会话 ----------
+// Compose 健康检查不依赖用户会话，仅暴露构建身份与存活状态。
+app.get('/api/health', async () => ({ ok: true, version: CURRENT_VERSION, revision: BUILD_REVISION || null }));
+
 app.post('/api/auth/login', async (req, reply) => {
   const { username, password } = (req.body as any) ?? {};
   const u = username ? findByUsername(username) : undefined;
@@ -1265,13 +1267,18 @@ app.all('/desktop/:id', desktopHandler);
 app.all('/desktop/:id/*', desktopHandler);
 
 // ---------- 静态 SPA + 前端路由回退 ----------
-function setStaticCacheHeaders(res: ServerResponse, pathName: string) {
-  if (pathName.endsWith('index.html') || pathName.endsWith('/sw.js') || pathName.endsWith('/manifest.webmanifest')) {
-    res.setHeader('Cache-Control', 'no-store, max-age=0');
+function setStaticCacheHeaders(reply: FastifyReply, pathName: string) {
+  if (
+    pathName.endsWith('index.html') ||
+    pathName.endsWith('/sw.js') ||
+    pathName.endsWith('/registerSW.js') ||
+    pathName.endsWith('/manifest.webmanifest')
+  ) {
+    reply.header('Cache-Control', 'no-store, max-age=0');
     return;
   }
   if (pathName.includes('/assets/')) {
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    reply.header('Cache-Control', 'public, max-age=31536000, immutable');
   }
 }
 

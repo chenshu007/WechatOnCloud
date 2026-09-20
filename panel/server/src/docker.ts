@@ -4,7 +4,7 @@ import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, 
 import http from 'node:http';
 import zlib from 'node:zlib';
 import Docker from 'dockerode';
-import { instanceAppType, getDesktopDark, type Instance } from './store.js';
+import { instanceAppType, requireSupportedApp, type Instance } from './store.js';
 
 const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
 const PUID = process.env.PUID || '1000';
@@ -120,10 +120,6 @@ function envList(inst: Instance): string[] {
   const appType = instanceAppType(inst);
   env.push(`WOC_APP_TYPE=${appType}`);
   if (appType === 'custom' && inst.customLaunch) env.push(`WOC_CUSTOM_LAUNCH=${inst.customLaunch}`);
-  // 深色模式：作为新实例启动时的初始明暗下发给 autostart（autostart 据此设 portal color-scheme，
-  // 微信等 Chromium 系应用即跟随系统深色）。开关由面板顶栏主题统一控制、持久化在 accounts.json，
-  // 运行中的实例则通过 setInstanceDark 实时切换（见下）。
-  if (getDesktopDark()) env.push('WOC_DARK=1');
   return env;
 }
 
@@ -150,6 +146,7 @@ async function ensureImage(): Promise<void> {
 
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
 export async function runInstance(inst: Instance): Promise<void> {
+  requireSupportedApp(inst);
   const net = await ensureNetwork();
   await ensureImage();
   try {
@@ -215,6 +212,7 @@ export async function runInstance(inst: Instance): Promise<void> {
 
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
 export async function ensureRunning(inst: Instance): Promise<void> {
+  requireSupportedApp(inst);
   try {
     const c = docker.getContainer(inst.containerName);
     const info = await c.inspect();
@@ -227,6 +225,7 @@ export async function ensureRunning(inst: Instance): Promise<void> {
 // 升级实例：拉取最新微信镜像后重建容器（保留数据卷 → 登录态不丢）。
 // 拉取失败（本地自构建 / 离线 / 仓库不可达）则用本地现有镜像重建，不阻断。
 export async function upgradeInstance(inst: Instance): Promise<void> {
+  requireSupportedApp(inst);
   try {
     await pullImage();
   } catch (e: any) {
@@ -239,6 +238,7 @@ export async function upgradeInstance(inst: Instance): Promise<void> {
 // 一个全新的唯一值（相当于"换一台新设备"）。用于某账号被腾讯风控标记后手动滚新设备身份。
 // 仅对含身份钩子的新镜像有效；旧镜像（升级前）无钩子，先 throw 提示升级，避免做无用功。
 export async function regenInstanceMachineId(inst: Instance): Promise<void> {
+  requireSupportedApp(inst);
   const hasHook = (
     await execCapture(inst, [
       'sh',
@@ -435,7 +435,7 @@ async function execCapture(inst: Instance, cmd: string[]): Promise<string> {
 // 回退老的 wechat-ctl.sh（旧实例都是微信）。appType 取值受 instanceAppType 约束，可安全内插进 shell。
 export async function triggerWechat(inst: Instance, cmd: 'install' | 'update'): Promise<void> {
   const c = docker.getContainer(inst.containerName);
-  const at = instanceAppType(inst);
+  const at = requireSupportedApp(inst);
   const action = cmd === 'update' ? 'update' : 'install';
   const exec = await c.exec({
     Cmd: ['bash', '-c', `if [ -x /woc/app-ctl.sh ]; then /woc/app-ctl.sh ${at} ${action}; else /woc/wechat-ctl.sh ${action}; fi`],
@@ -458,9 +458,12 @@ export interface WechatStatus {
 const DEFAULT_STATUS: WechatStatus = { phase: 'idle', percent: 0, installed: false, version: '', message: '未安装', updatedAt: 0 };
 
 export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
+  if (instanceAppType(inst) === 'chromium') {
+    return { ...DEFAULT_STATUS, phase: 'error', message: '浏览器实例功能已移除，原数据卷仍保留' };
+  }
   try {
     // 兼容旧容器（无 /woc/app-ctl.sh）：有则按 appType 取状态，无则回退老的 wechat-ctl.sh（旧实例皆微信）。
-    const at = instanceAppType(inst);
+    const at = requireSupportedApp(inst);
     const raw = await execCapture(inst, [
       'bash',
       '-c',

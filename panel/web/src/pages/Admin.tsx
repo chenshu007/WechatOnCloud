@@ -450,7 +450,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
               <EmptyState
                 icon="🖥️"
                 title="还没有实例"
-                sub="新建一个实例（微信 / Chromium 浏览器），进入后即可在浏览器里使用"
+                sub="新建一个微信实例，进入后即可在浏览器里使用"
                 action={
                   <button className="btn btn-primary" onClick={() => setCreatingInst(true)}>
                     ＋ 新建实例
@@ -1687,7 +1687,6 @@ function CreateUser({ instances, onClose, onDone }: { instances: InstanceWithSta
 // 可创建的应用类型。ready=false 的暂时禁用（即将支持）。Telegram（仅 x86_64）与其它应用暂缓。
 const APP_OPTIONS: { type: AppType; desc: string; ready: boolean }[] = [
   { type: 'wechat', desc: '默认', ready: true },
-  { type: 'chromium', desc: '浏览器', ready: true },
   { type: 'custom', desc: '即将支持', ready: false },
 ];
 
@@ -1749,9 +1748,6 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
           ))}
         </div>
         <input className="input" placeholder="实例名称（留空自动命名）" value={name} onChange={(e) => setName(e.target.value)} />
-        {appType === 'chromium' && (
-          <div className="muted small">Chromium 浏览器随镜像就绪，创建后直接「进入实例」即可（无需下载安装）。</div>
-        )}
         <div className="field-label">允许访问的子账号（管理员默认可访问全部）</div>
         <ChipMultiSelect
           options={subs.map((u) => ({ id: u.id, label: u.username }))}

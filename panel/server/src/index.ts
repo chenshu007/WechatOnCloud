@@ -1,11 +1,10 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
-import fstatic from '@fastify/static';
+import fstatic, { type FastifyStaticOptions } from '@fastify/static';
 import httpProxy from 'http-proxy';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
-import type { ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import {
   initStore,
@@ -30,8 +29,6 @@ import {
   setInstanceIcon,
   setInstanceUsers,
   publicInstance,
-  getDesktopDark,
-  setDesktopDark,
   APP_TYPES,
   type AppType,
   type User,
@@ -203,23 +200,6 @@ app.post('/api/admin/version/self-update', async (req, reply) => {
   }
 });
 
-// ---------- 实例桌面深色（与面板主题统一的那个开关）----------
-// 读取当前实例深色状态（任何登录用户可读，用于前端同步主题开关与实例的一致性）。
-app.get('/api/desktop-theme', async (req, reply) => {
-  if (!requireAuth(req, reply)) return;
-  return { dark: getDesktopDark() };
-});
-// 设置实例深色（管理员）。面板顶栏主题开关切到 深/浅 时调用：持久化即可。它作为浏览器(Chromium)实例
-// 启动时的明暗（经 envList → WOC_DARK 下发，autostart 据此加 --force-dark-mode），故**重启实例后生效**，
-// 不做在线切换（极简容器内无稳定的桌面 portal，微信也不跟随，详见 docker/autostart 注释）。
-app.post('/api/admin/desktop-theme', async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
-  const dark = !!(req.body as any)?.dark;
-  setDesktopDark(dark);
-  appendPanelLog('INFO', `实例深色设为 ${dark ? '深色' : '浅色'}（浏览器实例重启后生效）`);
-  return { ok: true, dark };
-});
-
 // ---------- 自助改密 ----------
 app.post('/api/account/password', async (req, reply) => {
   const u = requireAuth(req, reply);
@@ -367,7 +347,10 @@ app.post('/api/admin/instances', async (req, reply) => {
   if (!name || String(name).trim().length === 0 || String(name).length > 30) {
     return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
   }
-  const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
+  if (appType !== undefined && !APP_TYPES.includes(appType)) {
+    return reply.code(400).send({ error: '不支持的应用类型' });
+  }
+  const type: AppType = appType ?? 'wechat';
   // 复用卷：必须以 woc-data- 开头，且不能被现存实例占用。后端先校验，避免坏名穿透到 docker run。
   let reuseVolumeName: string | undefined;
   if (reuseVolume) {
@@ -1060,7 +1043,7 @@ app.all('/desktop/:id', desktopHandler);
 app.all('/desktop/:id/*', desktopHandler);
 
 // ---------- 静态 SPA + 前端路由回退 ----------
-function setStaticCacheHeaders(res: ServerResponse, pathName: string) {
+function setStaticCacheHeaders(res: Parameters<NonNullable<FastifyStaticOptions['setHeaders']>>[0], pathName: string) {
   if (pathName.endsWith('index.html') || pathName.endsWith('/sw.js') || pathName.endsWith('/manifest.webmanifest')) {
     res.setHeader('Cache-Control', 'no-store, max-age=0');
     return;
@@ -1211,7 +1194,7 @@ if (WATCHDOG_ENABLED) {
   const tick = async () => {
     for (const pub of listInstances()) {
       const inst = findInstance(pub.id);
-      if (!inst || recovering.has(inst.id)) continue;
+      if (!inst || inst.appType === 'chromium' || recovering.has(inst.id)) continue;
       try {
         if ((await instanceRuntime(inst)) !== 'running') {
           healthFails.delete(inst.id);

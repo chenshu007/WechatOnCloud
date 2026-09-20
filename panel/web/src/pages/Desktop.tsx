@@ -226,7 +226,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
 
   const inst = instances.find((i) => i.id === id);
-  const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Chromium…）
+  const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Telegram…）
   const appLabel = profile.label;
   // 进入实例时，共享列表可能尚未同步（管理页新建/安装后），先按"探测中"显示加载态，
   // 等列表刷新到该实例或超时后再判定是否真的不存在，避免从管理页跳转时误报"实例不存在"。

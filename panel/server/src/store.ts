@@ -26,23 +26,31 @@ export interface User {
 const DEFAULT_ADMIN_PASSWORD = 'wechat';
 
 // v1.2.0：实例可承载多种应用（不止微信）。同一镜像运行时按 appType 安装/启动对应应用。
-export type AppType = 'wechat' | 'telegram' | 'chromium' | 'custom';
-export const APP_TYPES: AppType[] = ['wechat', 'telegram', 'chromium', 'custom'];
+export type AppType = 'wechat' | 'telegram' | 'custom';
+// 仅保留旧记录的类型，便于查看/导出/删除数据；不再允许创建或启动浏览器实例。
+export type StoredAppType = AppType | 'chromium';
+export const APP_TYPES: AppType[] = ['wechat', 'telegram', 'custom'];
 export const APP_LABELS: Record<AppType, string> = {
   wechat: '微信',
   telegram: 'Telegram',
-  chromium: '浏览器',
   custom: '自定义应用',
 };
 // 向后兼容：v1.2.0 之前创建的实例没有 appType 字段，一律视为微信。
-export function instanceAppType(i: Instance): AppType {
+export function instanceAppType(i: Instance): StoredAppType {
+  if (i.appType === 'chromium') return i.appType;
   return i.appType && APP_TYPES.includes(i.appType) ? i.appType : 'wechat';
+}
+
+export function requireSupportedApp(inst: Instance): AppType {
+  const type = instanceAppType(inst);
+  if (type === 'chromium') throw new Error('浏览器实例功能已移除，原数据卷仍保留，可导出或删除');
+  return type;
 }
 
 export interface Instance {
   id: string; // 短 id，用于容器/卷命名
   name: string; // 显示名
-  appType?: AppType; // 承载的应用类型；缺省（老实例）= wechat（见 instanceAppType）
+  appType?: StoredAppType; // 承载的应用类型；缺省（老实例）= wechat（见 instanceAppType）
   icon?: string; // 自定义图标：data: 图片(base64) 或 builtin:<key>；缺省按 appType 取默认图标
   containerName: string; // woc-wx-<id>
   volumeName: string; // woc-data-<id>
@@ -61,8 +69,7 @@ export interface Instance {
 
 // 面板级全局设置（持久化进 accounts.json）。
 export interface Settings {
-  // 实例桌面深色模式：由面板顶栏的主题开关统一控制（管理员）。true=实例内应用走深色。
-  // 既作为新建/重启实例的初始明暗（经容器环境 WOC_DARK 下发），也用于对运行中实例实时切换。
+  // 旧版本的浏览器桌面主题，仅保留已有存储，不再读取或下发。
   desktopDark?: boolean;
 }
 
@@ -135,20 +142,6 @@ export function initStore() {
       console.log(`[store] 已重置用户 '${u.username}' 的密码（resetPassword 标记，密码=PANEL_ADMIN_PASSWORD 或默认 wechat）`);
     }
   }
-  persist();
-}
-
-// ---------- 全局设置 ----------
-export function getSettings(): Settings {
-  return data.settings || (data.settings = {});
-}
-
-export function getDesktopDark(): boolean {
-  return !!getSettings().desktopDark;
-}
-
-export function setDesktopDark(v: boolean) {
-  getSettings().desktopDark = !!v;
   persist();
 }
 
@@ -307,7 +300,8 @@ export function createInstance(
   reuseVolumeName?: string,
   appType: AppType = 'wechat',
 ) {
-  const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
+  if (!APP_TYPES.includes(appType)) throw new Error('不支持的应用类型');
+  const type = appType;
   let id = randomBytes(5).toString('hex'); // 10 hex chars
   let volumeName = `woc-data-${id}`;
   if (reuseVolumeName) {

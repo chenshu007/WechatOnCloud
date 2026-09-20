@@ -1,9 +1,9 @@
-import type { AppType } from './api';
+import type { AppType, StoredAppType } from './api';
 
 // 实例图标。支持三种来源（优先级从高到低）：
 //   1) 自定义上传/裁剪的图片 → inst.icon = "data:image/...;base64,..."
 //   2) 内置图标 → inst.icon = "builtin:<key>"（如 builtin:xiaohongshu）
-//   3) 缺省：按 appType 给默认图标（微信 / Chromium / Telegram / 通用）
+//   3) 缺省：按 appType 给默认图标（微信 / Telegram / 通用）
 // 内置图标用简洁 SVG（彩色圆角块 + 白色字形），风格统一、无需联网抓取。后续可往 BUILTIN 里加更多平台。
 
 type Glyph = { bg: string; el: JSX.Element };
@@ -43,7 +43,6 @@ const play = <path fill="#fff" d="M20 17l12 7-12 7z" />;
 // key → 字形。default-by-appType 与「内置图标选择器」共用同一张表。
 export const BUILTIN_ICONS: Record<string, Glyph> = {
   wechat: G('#07c160', chat),
-  chromium: G('#4285f4', globe),
   telegram: G('#2aabee', plane),
   xiaohongshu: G('#ff2442', txt('书')),
   douyin: G('#111111', txt('抖')),
@@ -57,7 +56,6 @@ export const BUILTIN_ICONS: Record<string, Glyph> = {
 // 「内置图标」选择器里展示的可选项（顺序即展示顺序）
 export const ICON_CHOICES: { key: string; label: string }[] = [
   { key: 'wechat', label: '微信' },
-  { key: 'chromium', label: 'Chromium' },
   { key: 'telegram', label: 'Telegram' },
   { key: 'xiaohongshu', label: '小红书' },
   { key: 'douyin', label: '抖音' },
@@ -69,7 +67,6 @@ export const ICON_CHOICES: { key: string; label: string }[] = [
 ];
 const DEFAULT_BY_APP: Record<AppType, string> = {
   wechat: 'wechat',
-  chromium: 'chromium',
   telegram: 'telegram',
   custom: 'app',
 };
@@ -81,7 +78,7 @@ export function InstanceIcon({
   radius = 12,
 }: {
   icon?: string;
-  appType?: AppType;
+  appType?: StoredAppType;
   size?: number;
   radius?: number;
 }) {
@@ -90,7 +87,7 @@ export function InstanceIcon({
     return <img src={icon} width={size} height={size} alt="" style={{ borderRadius: radius, objectFit: 'cover', display: 'block' }} />;
   }
   // 2) 内置 / 3) 默认
-  const key = icon && icon.startsWith('builtin:') ? icon.slice(8) : DEFAULT_BY_APP[appType ?? 'wechat'] ?? 'app';
+  const key = icon && icon.startsWith('builtin:') ? icon.slice(8) : (appType === 'chromium' ? 'app' : DEFAULT_BY_APP[appType ?? 'wechat']);
   const g = BUILTIN_ICONS[key] ?? BUILTIN_ICONS.app;
   return (
     <svg width={size} height={size} viewBox="0 0 48 48" style={{ display: 'block' }} aria-hidden="true">

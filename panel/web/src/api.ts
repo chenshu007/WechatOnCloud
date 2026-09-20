@@ -19,16 +19,16 @@ export interface WechatStatus {
 }
 
 export type RuntimeState = 'running' | 'stopped' | 'missing';
-export type AppType = 'wechat' | 'telegram' | 'chromium' | 'custom';
+export type AppType = 'wechat' | 'telegram' | 'custom';
+export type StoredAppType = AppType | 'chromium'; // 只用于展示旧记录，不可创建
 export const APP_LABELS: Record<AppType, string> = {
   wechat: '微信',
   telegram: 'Telegram',
-  chromium: 'Chromium',
   custom: '自定义应用',
 };
 
 // 各应用的 UI 画像，供卡片/桌面页按类型显示正确文案（避免到处写死「微信」）。
-//   needsInstall: 是否需要运行时下载安装（微信/Telegram 是；Chromium 已烤进镜像、即创建即就绪）。
+//   needsInstall: 是否需要运行时下载安装（微信/Telegram 是）。
 //   enterHint:    首次进入实例的提示。
 //   updateLabel:  「管理」菜单里的更新按钮文案（needsInstall=false 时不显示）。
 export interface AppProfile {
@@ -37,17 +37,17 @@ export interface AppProfile {
   enterHint: string;
   updateLabel: string;
 }
-export const APP_PROFILES: Record<AppType, AppProfile> = {
+export const APP_PROFILES: Record<StoredAppType, AppProfile> = {
   wechat: { label: '微信', needsInstall: true, enterHint: '首次进入请扫码登录微信', updateLabel: '更新微信' },
   telegram: { label: 'Telegram', needsInstall: true, enterHint: '首次进入请登录 Telegram', updateLabel: '更新 Telegram' },
-  chromium: { label: 'Chromium', needsInstall: false, enterHint: '浏览器已就绪，直接使用即可', updateLabel: '' },
+  chromium: { label: '已停用的浏览器实例', needsInstall: false, enterHint: '浏览器功能已移除，原数据卷仍保留，可在管理页导出或删除', updateLabel: '' },
   custom: { label: '自定义应用', needsInstall: true, enterHint: '', updateLabel: '更新' },
 };
-export const appProfile = (t?: AppType): AppProfile => APP_PROFILES[t ?? 'wechat'] ?? APP_PROFILES.wechat;
+export const appProfile = (t?: StoredAppType): AppProfile => APP_PROFILES[t ?? 'wechat'] ?? APP_PROFILES.wechat;
 export interface PanelInstance {
   id: string;
   name: string;
-  appType?: AppType; // 缺省（老实例）= wechat
+  appType?: StoredAppType; // 缺省（老实例）= wechat
   icon?: string; // 自定义图标：data: 图片 / builtin:<key>；缺省按 appType 取默认图标
   createdAt: string;
   createdBy: string;
@@ -174,14 +174,6 @@ export const api = {
   checkUpdate: () => req<VersionInfo>('/api/admin/version/check', { method: 'POST' }),
   // 一键更新面板自身：拉新镜像 + 派生 helper 容器重建 woc-panel（带回滚）。返回后面板会重启。
   selfUpdatePanel: () => req<{ ok: boolean; target: string; message: string }>('/api/admin/version/self-update', { method: 'POST' }),
-
-  // 实例桌面深色（与面板主题统一的那个开关）：读取当前态 + 设置（管理员，实时切换运行中实例）。
-  getDesktopTheme: () => req<{ dark: boolean }>('/api/desktop-theme'),
-  setDesktopTheme: (dark: boolean) =>
-    req<{ ok: boolean; dark: boolean; applied: number; failed: number }>('/api/admin/desktop-theme', {
-      method: 'POST',
-      body: JSON.stringify({ dark }),
-    }),
 
   // 子账号
   listUsers: () => req<{ users: PanelUser[] }>('/api/admin/users'),

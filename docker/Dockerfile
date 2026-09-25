@@ -8,14 +8,6 @@ FROM lscr.io/linuxserver/baseimage-kasmvnc:debianbookworm
 # 需的全部系统库（这些需 root/apt，必须 bake 进镜像）。
 ENV DEBIAN_FRONTEND=noninteractive
 
-# ⚠️ Chromium 版本锚定（架构守则 R1）——绝不跟随 Debian 滚动：
-# Debian 源只保留最新版 chromium，而新版本在本容器栈（KasmVNC/Xvnc + 软件渲染）上反复引入致命崩溃：
-#   · 149 收紧变换矩阵断言（叠加 DPI bug 全面崩溃，v1.4.0 已修 DPI）；
-#   · 150 「非首次启动」路径与 --start-maximized 直接 SIGTRAP → 浏览器实例必黑屏（无任何 flag 可绕）。
-# 故从 snapshot.debian.org 的固定快照安装验证过的版本。升级 chromium = 显式改下面两行（快照时间戳 +
-# 版本号），并跑通 doc/dev/发布门禁.md 的全部探针后才允许合并。
-ARG CHROMIUM_SNAPSHOT=20260704T180435Z
-ARG CHROMIUM_VERSION=149.0.7827.196-1~deb12u1
 # ⚠️ CI 的 QEMU arm64 模拟下 apt-get update OOM（"Cannot allocate memory"，触发点是解析
 # download.docker.com InRelease）导致实例镜像发不出去。根因是 apt 要解析一大堆【构建根本用不到】
 # 的源（deb-src 源码索引、backports、docker、nodesource），内存峰值在模拟环境里爆掉。
@@ -30,17 +22,12 @@ RUN set -eux; \
       echo "deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware"; \
       echo "deb http://security.debian.org/debian-security/ bookworm-security main contrib non-free non-free-firmware"; \
     } > /etc/apt/sources.list; \
-    echo "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${CHROMIUM_SNAPSHOT}/ bookworm-security main" \
-      > /etc/apt/sources.list.d/woc-chromium-pin.list; \
-    printf 'Package: chromium*\nPin: version %s\nPin-Priority: 1001\n' "${CHROMIUM_VERSION}" \
-      > /etc/apt/preferences.d/woc-chromium-pin; \
     apt-get -o Acquire::Languages=none -o Acquire::Retries=3 update; \
     apt-get install -y --no-install-recommends \
         curl ca-certificates locales dpkg \
         fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
         libnss3 libgbm1 libasound2 libxss1 \
         xz-utils \
-        chromium="${CHROMIUM_VERSION}" \
         xdotool xclip \
         xwallpaper xsettingsd \
         # 微信原生版是 Qt 程序，依赖一组 xcb 平台库；libxcb-cursor0 由 Qt 动态 dlopen，ldd 查不到，需主动装。
@@ -49,8 +36,6 @@ RUN set -eux; \
         # WeChatAppEx 是 Chromium 内核，需 GTK3 全家桶 + 一组 X 扩展 + cups
         libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 \
         libxcomposite1 libxrandr2 libxfixes3 libxtst6 libxshmfence1 libdrm2; \
-    chromium --version; \
-    rm -f /etc/apt/sources.list.d/woc-chromium-pin.list /etc/apt/preferences.d/woc-chromium-pin; \
     mv /woc-apt-bak/sources.list /etc/apt/sources.list; \
     mv /woc-apt-bak/docker.list /woc-apt-bak/nodesource.list /etc/apt/sources.list.d/ 2>/dev/null || true; \
     rm -rf /woc-apt-bak; \
@@ -105,3 +90,10 @@ RUN chmod 755 /custom-cont-init.d/02-woc-app
 
 # 3000 = HTTP web 客户端, 3001 = HTTPS
 EXPOSE 3000 3001
+
+ARG WOC_SOURCE_REVISION
+ARG WOC_VERSION
+LABEL io.wechatoncloud.variant="no-chromium" \
+      org.opencontainers.image.source="https://github.com/chenshu007/WechatOnCloud" \
+      org.opencontainers.image.revision="${WOC_SOURCE_REVISION}" \
+      org.opencontainers.image.version="${WOC_VERSION}"

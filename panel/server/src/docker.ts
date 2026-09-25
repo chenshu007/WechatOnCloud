@@ -1,69 +1,21 @@
+import { assertActive, assertImageRef, assertImageIdentity, RETIRED_MESSAGE } from './no-chromium.js';
 import { hostname } from 'node:os';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, readPanelLog, filterSince } from './logs.js';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import Docker from 'dockerode';
-import { instanceAppType, getDesktopDark, type Instance } from './store.js';
+import { instanceAppType, type Instance } from './store.js';
 
-// 实例镜像引用。版本耦合（架构守则 R1）：面板与实例镜像同一 release 同步出包、按同版本号
-// 互相验证——正式版面板把 :latest 改写为与自身相同的版本 tag（如 1.4.1），保证
-// 「面板 vX 管的实例镜像也是 vX」，杜绝旧面板拉到新实例镜像（或反之）产生未验证组合。
-// 用户在 env 显式指定了非 latest tag（自行锁版）则完全尊重；开发版面板（dev-*）保持 latest。
-function resolveWechatImage(): string {
-  const raw = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
-  const ver = (process.env.WOC_VERSION || '').trim().replace(/^v/, '');
-  if (!/^\d+\.\d+\.\d+$/.test(ver)) return raw; // 开发版/未知版本 → 保持原样
-  const noDigest = raw.split('@')[0];
-  const m = noDigest.match(/^(.*):([^/:]+)$/);
-  if (m && m[2] !== 'latest') return raw; // 用户显式锁了别的 tag → 尊重
-  const repo = m ? m[1] : noDigest;
-  return `${repo}:${ver}`;
+// Explicit immutable configuration: no version rewriting or latest fallback.
+const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || '';
+export async function resolveInstanceImage(): Promise<void> { assertImageRef(WECHAT_IMAGE); }
+async function validatedImage(ref = WECHAT_IMAGE): Promise<string> {
+  const image = await docker.getImage(ref).inspect();
+  assertImageIdentity(image);
+  return image.Id;
 }
-// 注意：可被 resolveInstanceImage() 在启动时改写为 :latest 兜底（见下），故用 let。
-let WECHAT_IMAGE = resolveWechatImage();
 
-// 版本耦合的安全兜底（P0：issue #112 后续）。版本耦合让面板偏好「与自身同版本」的实例镜像 tag，
-// 但若该 tag 确实没发布（典型如某次 CI 只发布了面板、实例镜像构建失败），面板会指向一个不存在的
-// tag，导致可升级检测恒空、创建/升级实例拉取失败。故启动时校验一次。
-//
-// ⚠️ 关键（issue #114）：必须区分「仓库明确说没有(404)」和「压根连不上仓库」。
-// 国内 NAS 极常见的情形是：`docker pull` 走加速镜像【能通】，但面板进程直连 registry API 的 fetch
-// 【不通】。旧实现把两者都当成"不存在"→ 回退到本地那份可能几周前的 `:latest` → 用户面板明明是新版、
-// 实例却永远停在老镜像，还打出"很可能该版本未成功发布"的误导文案。
-// 现在：只有仓库【确认 404】才回退；连不上时保持版本 tag（乐观），把判决权交给真正的 `docker pull`
-// （它有镜像加速配置，多半能拉到）；真拉不到时再由 ensureImage 兜底回退（见那里）。
-let imageResolved = false;
-export async function resolveInstanceImage(): Promise<void> {
-  if (imageResolved) return;
-  imageResolved = true;
-  const preferred = WECHAT_IMAGE;
-  const tagM = preferred.split('@')[0].match(/:([^/:]+)$/);
-  if (!tagM || tagM[1] === 'latest') return; // 已是 latest 或无 tag → 无需兜底
-  try {
-    await docker.getImage(preferred).inspect();
-    return; // 本地已有该版本镜像 → 用它
-  } catch {
-    /* 本地没有，继续查 registry */
-  }
-  const ref = parseImageRef(preferred);
-  const probe = ref ? await probeManifest(ref) : ({ ok: false, reason: 'unreachable' } as const);
-  if (probe.ok) return; // 仓库上存在该版本 → 用它（ensureImage 会拉）
-  if (probe.reason === 'unreachable') {
-    // 连不上仓库 ≠ 版本不存在。保持版本 tag，让 docker pull（可能走加速镜像）去试。
-    appendPanelLog(
-      'WARN',
-      `无法连接镜像仓库校验 ${preferred}（网络受限？），仍按该版本拉取；若拉取失败会自动回退 :latest`,
-    );
-    return;
-  }
-  const fallback = preferred.replace(/:[^/:]+$/, ':latest');
-  appendPanelLog(
-    'WARN',
-    `镜像仓库确认不存在 ${preferred}（该版本的实例镜像可能未成功发布），回退使用 ${fallback}`,
-  );
-  WECHAT_IMAGE = fallback;
-}
 const PUID = process.env.PUID || '1000';
 const PGID = process.env.PGID || '1000';
 const TZ = process.env.TZ || 'Asia/Shanghai';
@@ -234,57 +186,18 @@ function envList(inst: Instance): string[] {
   const appType = instanceAppType(inst);
   env.push(`WOC_APP_TYPE=${appType}`);
   if (appType === 'custom' && inst.customLaunch) env.push(`WOC_CUSTOM_LAUNCH=${inst.customLaunch}`);
-  // 深色模式：作为新实例启动时的初始明暗下发给 autostart（autostart 据此设 portal color-scheme，
-  // 微信等 Chromium 系应用即跟随系统深色）。开关由面板顶栏主题统一控制、持久化在 accounts.json，
-  // 运行中的实例则通过 setInstanceDark 实时切换（见下）。
-  if (getDesktopDark()) env.push('WOC_DARK=1');
   // baseimage 的 init-nginx 只看 DISABLE_IPV6 是否已设置，设了就删掉 `listen [::]`（每次启动重新生成配置，故须常驻于容器环境）
   if (NO_IPV6) env.push('DISABLE_IPV6=1');
   return env;
 }
 
 // 确保微信镜像在本地存在；缺失则从 GHCR 拉取（首次新建实例时镜像通常还没拉过）。
-async function ensureImage(): Promise<void> {
-  await resolveInstanceImage(); // 版本兜底：若耦合的版本 tag 不可达则先回退 :latest
-  try {
-    await docker.getImage(WECHAT_IMAGE).inspect();
-    return;
-  } catch {
-    /* 本地没有，下面拉取 */
-  }
-  // 首次新建实例常卡在这一步（NAS 直连 docker.io 拉取超时，见 README）。这里前后都打日志：
-  // 若诊断包里只见"开始拉取"而无"完成/失败"，即可定位为拉取卡死。
-  appendPanelLog('INFO', `本地无实例镜像 ${WECHAT_IMAGE}，开始拉取（首次较慢；NAS 直连 docker.io 可能超时）…`);
-  const t0 = Date.now();
-  try {
-    await pullImage();
-    appendPanelLog('INFO', `实例镜像拉取完成 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）`);
-    return;
-  } catch (e: any) {
-    appendPanelLog('ERROR', `实例镜像拉取失败 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）：${e?.message || e}`);
-    // 真兜底（issue #114）：版本 tag 拉不到时，若本地已有 :latest 就退而求其次用它，别让用户彻底不能用。
-    // 这里基于【真实拉取失败】而非探测猜测——docker pull 有镜像加速配置，探测不通不代表拉不到。
-    const fb = fallbackLatestRef();
-    if (fb) {
-      try {
-        await docker.getImage(fb).inspect();
-        appendPanelLog('WARN', `改用本地已有的 ${fb} 重建（注意：它可能是较旧的镜像；网络恢复后请重新「升级实例」拿到 ${WECHAT_IMAGE}）`);
-        WECHAT_IMAGE = fb;
-        return;
-      } catch {
-        /* 本地也没有 :latest → 无可兜底，抛出原错误 */
-      }
-    }
-    throw e;
-  }
-}
-
-// 当前镜像引用对应的 :latest 形式；已是 latest / 无 tag 则返回 null（无可回退）。
-function fallbackLatestRef(): string | null {
-  const noDigest = WECHAT_IMAGE.split('@')[0];
-  const m = noDigest.match(/^(.*):([^/:]+)$/);
-  if (!m || m[2] === 'latest') return null;
-  return `${m[1]}:latest`;
+async function ensureImage(): Promise<string> {
+  assertImageRef(WECHAT_IMAGE);
+  try { return await validatedImage(); }
+  catch (e: any) { if (e?.statusCode !== 404) throw e; }
+  await pullImage();
+  return validatedImage();
 }
 
 // ---------- 自定义数据目录 WOC_DATA_ROOT（#133 #127，取代 PR #69 的做法） ----------
@@ -387,21 +300,21 @@ export async function describeInstanceVolume(name: string): Promise<string> {
 // 若本地新镜像恰好是坏的，一次看门狗自愈就能弄坏一个用户从没升级过的实例）。
 // 换镜像只允许发生在显式「升级实例」（不带 keepImage）。
 export async function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
-  const net = await ensureNetwork();
-  let imageOverride: string | undefined;
-  try {
-    const existing = docker.getContainer(inst.containerName);
-    const info = await existing.inspect();
-    if (opts?.keepImage && info.Image) imageOverride = String(info.Image);
-    // 删除前先把旧容器最后日志快照进持久日志，否则随容器删除就看不到"上次为何停/崩"。
-    await snapshotContainerLog(inst, '容器重建（重启/升级/自愈），保留上一容器最后日志');
-    await existing.remove({ force: true });
-  } catch {
-    /* 不存在，正常 */
+  assertActive(inst);
+  assertImageRef(WECHAT_IMAGE);
+  const existing = docker.getContainer(inst.containerName);
+  let info: any;
+  try { info = await existing.inspect(); }
+  catch (e: any) { if (e?.statusCode !== 404) throw e; }
+  const imageOverride = await ensureImage();
+  if (opts?.keepImage && info?.Image && await validatedImage(String(info.Image)) !== imageOverride) {
+    throw new Error('当前实例镜像与指定定制镜像不一致，请显式升级实例');
   }
-  // 沿用旧镜像重建时无需 ensureImage（镜像 id 一定在本地——容器刚在用它）；
-  // 也避免"离线 + 本地无 :latest"时连重启都失败。
-  if (!imageOverride) await ensureImage();
+  const net = await ensureNetwork();
+  if (info) {
+    await snapshotContainerLog(inst, '容器重建，保留上一容器最后日志');
+    await existing.remove({ force: true });
+  }
   await ensureInstanceVolume(inst, imageOverride || WECHAT_IMAGE);
   // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
   const vids = videoDevices();
@@ -474,29 +387,28 @@ export async function runInstance(inst: Instance, opts?: { keepImage?: boolean }
 
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
 export async function ensureRunning(inst: Instance): Promise<void> {
-  try {
-    const c = docker.getContainer(inst.containerName);
-    const info = await c.inspect();
-    if (!info.State?.Running) await c.start();
-  } catch {
-    await runInstance(inst);
+  assertActive(inst);
+  const c = docker.getContainer(inst.containerName);
+  let info: any;
+  try { info = await c.inspect(); }
+  catch (e: any) { if (e?.statusCode !== 404) throw e; }
+  if (!info) return runInstance(inst);
+  // Do not disturb an existing running container. Starting requires trusted identity.
+  if (!info.State?.Running) {
+    assertImageRef(WECHAT_IMAGE);
+    const target = await ensureImage();
+    if (await validatedImage(String(info.Image)) !== target) throw new Error('当前实例镜像与指定定制镜像不一致，请显式升级实例');
+    await c.start();
   }
 }
 
 // 升级实例：拉取最新微信镜像后重建容器（保留数据卷 → 登录态不丢）。
-// 拉取失败（本地自构建 / 离线 / 仓库不可达）则用本地现有镜像重建，不阻断。
+// 拉取失败立即停止；不得使用普通版或本地旧镜像兜底。
 // skipPull：批量升级时由调用方先统一拉取一次，避免 N 个实例拉 N 次（受限网络下每次
 // 都要等到拉取停滞超时，表现为"一键升级卡死"）。
 export async function upgradeInstance(inst: Instance, opts?: { skipPull?: boolean }): Promise<void> {
-  let pullErr: any = null;
-  if (!opts?.skipPull) {
-    try {
-      await pullImage();
-    } catch (e: any) {
-      pullErr = e;
-      console.warn('[docker] 升级时拉取镜像失败，改用本地镜像重建:', e?.message || e);
-    }
-  }
+  assertActive(inst);
+  if (!opts?.skipPull) await pullImage();
   // 记录升级前镜像，用于事后判断"升级是否真的换了镜像"（issue #112：拉取失败静默回退旧镜像，
   // 用户被告知"完成"、实际什么都没变，且无从自查）。
   const before = await (async () => {
@@ -526,16 +438,9 @@ export async function upgradeInstance(inst: Instance, opts?: { skipPull?: boolea
       return '';
     }
   })();
-  if (pullErr && before && after === before) {
-    // 诚实汇报：拉取失败且镜像未变 = 这次"升级"没有升级任何东西。抛错让调用方按失败处理，
-    // 用户才知道要去解决网络/镜像源问题，而不是误以为已修复。
-    throw new Error(
-      `拉取新镜像失败（${pullErr?.message || pullErr}），实例仍在原镜像上重建（未升级）。请检查网络/镜像源后重试`,
-    );
-  }
   if (before && after !== before) {
     appendInstanceLog(inst.id, `镜像已更换：${before.slice(7, 19)} → ${after.slice(7, 19)}`);
-  } else if (!pullErr) {
+  } else {
     appendInstanceLog(inst.id, '镜像已是最新，无需更换');
   }
 }
@@ -606,6 +511,7 @@ export async function pruneDanglingImages(): Promise<void> {
 // 一个全新的唯一值（相当于"换一台新设备"）。用于某账号被腾讯风控标记后手动滚新设备身份。
 // 仅对含身份钩子的新镜像有效；旧镜像（升级前）无钩子，先 throw 提示升级，避免做无用功。
 export async function regenInstanceMachineId(inst: Instance): Promise<void> {
+  assertActive(inst);
   const hasHook = (
     await execCapture(inst, [
       'sh',
@@ -773,8 +679,8 @@ export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
 // 本地「最新实例镜像」的 Id（新建/升级实例会用到的镜像）。查不到（未拉取过）返回 null。
 export async function latestInstanceImageId(): Promise<string | null> {
   try {
-    const img: any = await docker.getImage(WECHAT_IMAGE).inspect();
-    return String(img.Id);
+    assertImageRef(WECHAT_IMAGE);
+    return await validatedImage();
   } catch {
     return null;
   }
@@ -783,7 +689,7 @@ export async function latestInstanceImageId(): Promise<string | null> {
 // 实例是否「镜像落后」：其运行中容器的镜像 Id 与本地最新镜像不一致（即重建就会换新镜像）。
 // 容器不存在 / 查不到最新镜像时返回 false（不打扰）。传入 latestId 复用一次查询，避免 N 次 inspect。
 export async function instanceOutdated(inst: Instance, latestId: string | null): Promise<boolean> {
-  if (!latestId) return false;
+  if (inst.appType === 'chromium' || !latestId) return false;
   try {
     const info: any = await docker.getContainer(inst.containerName).inspect();
     const cur = String(info.Image || '');
@@ -985,6 +891,7 @@ async function execCapture(inst: Instance, cmd: string[], user = 'abc'): Promise
 // wechat-ctl.sh；telegram 等各自实现。兼容旧容器（升级前镜像里没有 /woc/app-ctl.sh）：有则用之，无则
 // 回退老的 wechat-ctl.sh（旧实例都是微信）。appType 取值受 instanceAppType 约束，可安全内插进 shell。
 export async function triggerWechat(inst: Instance, cmd: 'install' | 'update'): Promise<void> {
+  assertActive(inst);
   const c = docker.getContainer(inst.containerName);
   const at = instanceAppType(inst);
   const action = cmd === 'update' ? 'update' : 'install';
@@ -1009,6 +916,7 @@ export interface WechatStatus {
 const DEFAULT_STATUS: WechatStatus = { phase: 'idle', percent: 0, installed: false, version: '', message: '未安装', updatedAt: 0 };
 
 export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
+  if (inst.appType === 'chromium') return { ...DEFAULT_STATUS, phase: 'error', message: RETIRED_MESSAGE };
   try {
     // 兼容旧容器（无 /woc/app-ctl.sh）：有则按 appType 取状态，无则回退老的 wechat-ctl.sh（旧实例皆微信）。
     const at = instanceAppType(inst);
@@ -1030,7 +938,8 @@ export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
 let pullInFlight: Promise<void> | null = null;
 export function pullImage(onProgress?: (line: any) => void): Promise<void> {
   if (pullInFlight) return pullInFlight;
-  pullInFlight = doPullImage(onProgress).finally(() => {
+  assertImageRef(WECHAT_IMAGE);
+  pullInFlight = doPullImage(onProgress).then(async () => { await validatedImage(); }).finally(() => {
     pullInFlight = null;
     invalidateRemoteImageCache(); // 本地镜像可能已更新 → 远端新版检测缓存作废
   });
@@ -1545,9 +1454,26 @@ export async function volDownloadFile(inst: Instance, rel: string): Promise<Buff
 // 整卷备份：把 /config 打成 tar 流并经 gzip 输出（路由直接 pipe 给响应，避免大文件入内存）。
 // getArchive('/config') 的条目前缀为 config/，恢复时解到容器根即可落回 /config。
 export async function volBackupStream(inst: Instance): Promise<NodeJS.ReadableStream> {
-  const tar = (await docker.getContainer(inst.containerName).getArchive({ path: VOL_ROOT })) as NodeJS.ReadableStream;
+  let helper: Docker.Container | undefined;
+  let source = docker.getContainer(inst.containerName);
+  try { await source.inspect(); }
+  catch (e: any) {
+    if (e?.statusCode !== 404) throw e;
+    // inspect first: never let Docker silently create a missing production volume.
+    await docker.getVolume(inst.volumeName).inspect();
+    const image = await ensureImage();
+    helper = await docker.createContainer({ Image: image, Entrypoint: ['/bin/sh'], Cmd: ['-c', 'sleep 3600'],
+      HostConfig: { Binds: [`${inst.volumeName}:/config:ro`], NetworkMode: 'none', ReadonlyRootfs: true,
+        CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges'] } });
+    try { await helper.start(); } catch (err) { await helper.remove({ force: true }); throw err; }
+    source = helper;
+  }
+  let tar: NodeJS.ReadableStream;
+  try { tar = await source.getArchive({ path: VOL_ROOT }) as NodeJS.ReadableStream; }
+  catch (err) { if (helper) await helper.remove({ force: true }); throw err; }
   const gzip = zlib.createGzip();
   tar.on('error', (e) => gzip.destroy(e as Error));
+  gzip.once('close', () => { (tar as any).destroy?.(); if (helper) void helper.remove({ force: true }).catch(() => {}); });
   return tar.pipe(gzip);
 }
 

@@ -199,11 +199,11 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
       </div>
       <div className="settings-block">
         <div className="s-title-row">
-          <span className="s-app">云微 · WechatOnCloud</span>
+          <span className="s-app">云微 · WechatOnCloud · no-Chromium</span>
           {info?.isDev ? <span className="tag">开发版</span> : info?.hasUpdate ? <span className="tag tag-warn">有新版</span> : null}
         </div>
         <p className="s-line">
-          当前版本 <b>{info?.current ?? '…'}</b>
+          面板自更新已禁用；请通过定制双镜像发布流程更新。当前版本 <b>{info?.current ?? '…'}</b>
           {info?.latest && !info.error && (info.isDev || info.hasUpdate) && (
             <>
               {' · '}最新{info.isDev ? '发布' : ''} <b>{info.latest}</b>
@@ -1373,7 +1373,7 @@ function InstanceAdminCard({
         <>
           <div className="inst-actions">
             {offline ? (
-              <button className="btn btn-primary inst-act-wide" onClick={onStart}>
+              <button className="btn btn-primary inst-act-wide" disabled={inst.appType === 'chromium'} onClick={onStart}>
                 {inst.runtime === 'missing' ? '创建并启动' : '启动实例'}
               </button>
             ) : (
@@ -1399,11 +1399,11 @@ function InstanceAdminCard({
                       {installed ? profile.updateLabel : '下载安装'}
                     </button>
                   )}
-                  <button className="btn-text" onClick={onUpgrade} title="拉取最新镜像并重建（保留聊天记录）">
+                  <button className="btn-text" disabled={inst.appType === 'chromium'} onClick={onUpgrade} title="拉取最新镜像并重建（保留聊天记录）">
                     升级实例
                   </button>
                   {!offline && (
-                    <button className="btn-text" onClick={onRestart}>
+                    <button className="btn-text" disabled={inst.appType === 'chromium'} onClick={onRestart}>
                       重启
                     </button>
                   )}
@@ -1933,7 +1933,6 @@ function CreateUser({ instances, onClose, onDone }: { instances: InstanceWithSta
 // 可创建的应用类型。ready=false 的暂时禁用（即将支持）。Telegram（仅 x86_64）与其它应用暂缓。
 const APP_OPTIONS: { type: AppType; desc: string; ready: boolean }[] = [
   { type: 'wechat', desc: '默认', ready: true },
-  { type: 'chromium', desc: '浏览器', ready: true },
   { type: 'custom', desc: '即将支持', ready: false },
 ];
 
@@ -1995,9 +1994,6 @@ function CreateInstance({ subs, onClose, onDone }: { subs: PanelUser[]; onClose:
           ))}
         </div>
         <input className="input" placeholder="实例名称（留空自动命名）" value={name} onChange={(e) => setName(e.target.value)} />
-        {appType === 'chromium' && (
-          <div className="muted small">Chromium 浏览器随镜像就绪，创建后直接「进入实例」即可（无需下载安装）。</div>
-        )}
         <div className="field-label">允许访问的子账号（管理员默认可访问全部）</div>
         <ChipMultiSelect
           options={subs.map((u) => ({ id: u.id, label: u.username }))}

@@ -23,7 +23,7 @@ export type AppType = 'wechat' | 'telegram' | 'chromium' | 'custom';
 export const APP_LABELS: Record<AppType, string> = {
   wechat: '微信',
   telegram: 'Telegram',
-  chromium: 'Chromium',
+  chromium: 'Chromium（retired）',
   custom: '自定义应用',
 };
 
@@ -40,7 +40,7 @@ export interface AppProfile {
 export const APP_PROFILES: Record<AppType, AppProfile> = {
   wechat: { label: '微信', needsInstall: true, enterHint: '首次进入请扫码登录微信', updateLabel: '更新微信' },
   telegram: { label: 'Telegram', needsInstall: true, enterHint: '首次进入请登录 Telegram', updateLabel: '更新 Telegram' },
-  chromium: { label: 'Chromium', needsInstall: false, enterHint: '浏览器已就绪，直接使用即可', updateLabel: '' },
+  chromium: { label: 'Chromium（retired）', needsInstall: false, enterHint: '已退役；数据保留，可导出或显式删除', updateLabel: '' },
   custom: { label: '自定义应用', needsInstall: true, enterHint: '', updateLabel: '更新' },
 };
 export const appProfile = (t?: AppType): AppProfile => APP_PROFILES[t ?? 'wechat'] ?? APP_PROFILES.wechat;

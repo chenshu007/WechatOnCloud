@@ -1,3 +1,4 @@
+import { assertActive } from './no-chromium.js';
 import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -31,7 +32,7 @@ export const APP_TYPES: AppType[] = ['wechat', 'telegram', 'chromium', 'custom']
 export const APP_LABELS: Record<AppType, string> = {
   wechat: '微信',
   telegram: 'Telegram',
-  chromium: '浏览器',
+  chromium: 'Chromium（retired）',
   custom: '自定义应用',
 };
 // 向后兼容：v1.2.0 之前创建的实例没有 appType 字段，一律视为微信。
@@ -251,6 +252,7 @@ export function publicInstance(i: Instance) {
   return {
     id: i.id,
     name: i.name,
+    retired: i.appType === 'chromium',
     appType: instanceAppType(i), // 老实例无字段时回退 wechat
     icon: i.icon,
     createdAt: i.createdAt,
@@ -320,6 +322,7 @@ export function createInstance(
   reuseVolumeName?: string,
   appType: AppType = 'wechat',
 ) {
+  assertActive({ appType });
   const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
   let id = randomBytes(5).toString('hex'); // 10 hex chars
   let volumeName = `woc-data-${id}`;

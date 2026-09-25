@@ -1,3 +1,4 @@
+import { RETIRED_MESSAGE, UPDATE_MESSAGE } from './no-chromium.js';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import fstatic from '@fastify/static';
@@ -30,8 +31,6 @@ import {
   setInstanceIcon,
   setInstanceUsers,
   publicInstance,
-  getDesktopDark,
-  setDesktopDark,
   APP_TYPES,
   type AppType,
   type User,
@@ -46,8 +45,6 @@ import {
   latestInstanceImageId,
   instanceOutdated,
   pullImage,
-  pruneDanglingImages,
-  pruneOldWocImages,
   remoteInstanceImageNewer,
   resolveInstanceImage,
   removeInstance as removeInstanceContainer,
@@ -98,7 +95,6 @@ import {
 import { createSession, getSession, destroySession, destroyUserSessions, SESSION_TTL_MS } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
-import { triggerSelfUpdate } from './self-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -258,34 +254,10 @@ app.post('/api/admin/version/check', async (req, reply) => {
   return await checkForUpdate();
 });
 
-// 一键更新面板自身（管理员）：拉新镜像 → 派生 helper 容器重建 woc-panel（带健康检查 + 失败回滚）。
-// 返回后面板会在十几秒内被 helper 重启，前端提示用户稍候刷新。
+// Custom releases update panel + instance together through the reviewed release workflow.
 app.post('/api/admin/version/self-update', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
-  try {
-    const { target } = await triggerSelfUpdate();
-    return { ok: true, target, message: '已开始更新：面板将在十几秒内重启为新版本，请稍候刷新页面' };
-  } catch (e: any) {
-    appendPanelLog('ERROR', `面板自更新失败：${e?.message || e}`);
-    return reply.code(500).send({ error: '更新失败：' + (e?.message || e) });
-  }
-});
-
-// ---------- 实例桌面深色（与面板主题统一的那个开关）----------
-// 读取当前实例深色状态（任何登录用户可读，用于前端同步主题开关与实例的一致性）。
-app.get('/api/desktop-theme', async (req, reply) => {
-  if (!requireAuth(req, reply)) return;
-  return { dark: getDesktopDark() };
-});
-// 设置实例深色（管理员）。面板顶栏主题开关切到 深/浅 时调用：持久化即可。它作为浏览器(Chromium)实例
-// 启动时的明暗（经 envList → WOC_DARK 下发，autostart 据此加 --force-dark-mode），故**重启实例后生效**，
-// 不做在线切换（极简容器内无稳定的桌面 portal，微信也不跟随，详见 docker/autostart 注释）。
-app.post('/api/admin/desktop-theme', async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
-  const dark = !!(req.body as any)?.dark;
-  setDesktopDark(dark);
-  appendPanelLog('INFO', `实例深色设为 ${dark ? '深色' : '浅色'}（浏览器实例重启后生效）`);
-  return { ok: true, dark };
+  return reply.code(409).send({ error: UPDATE_MESSAGE });
 });
 
 // ---------- 自助改密 ----------
@@ -400,7 +372,7 @@ app.get('/api/instances', async (req, reply) => {
         wechatStatus(inst),
         instanceImageVersion(inst), // 实例镜像版本（CI label；自构建为短 id）——让用户能自查"到底跑的哪版"
       ]);
-      return { ...pub, runtime, wechat: wx, imageVersion };
+      return { ...publicInstance(inst), runtime, wechat: wx, imageVersion };
     }),
   );
   return { instances: out };
@@ -417,6 +389,7 @@ app.post('/api/instances/:id/heal', async (req, reply) => {
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  if (inst.appType === 'chromium') return reply.code(410).send({ error: RETIRED_MESSAGE });
   const now = Date.now();
   if (now - (lastHealAt.get(id) || 0) < 180000) {
     return { ok: true, restarted: false, message: '近期已尝试恢复，请稍候重连' };
@@ -454,6 +427,7 @@ app.post('/api/admin/instances', async (req, reply) => {
   if (!name || String(name).trim().length === 0 || String(name).length > 30) {
     return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
   }
+  if (appType === 'chromium') return reply.code(410).send({ error: RETIRED_MESSAGE });
   const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
   // 复用卷：必须以 woc-data- 开头，且不能被现存实例占用。后端先校验，避免坏名穿透到 docker run。
   let reuseVolumeName: string | undefined;
@@ -650,6 +624,7 @@ app.post('/api/admin/instances/:id/start', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  if (inst.appType === 'chromium') return reply.code(410).send({ error: RETIRED_MESSAGE });
   try {
     await ensureRunning(inst);
     appendPanelLog('INFO', `启动实例「${inst.name}」(id=${inst.id})`);
@@ -680,6 +655,7 @@ app.post('/api/admin/instances/:id/restart', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  if (inst.appType === 'chromium') return reply.code(410).send({ error: RETIRED_MESSAGE });
   try {
     appendPanelLog('INFO', `重启实例「${inst.name}」(id=${inst.id})`);
     await runInstance(inst, { keepImage: true }); // 重启必须幂等：沿用当前镜像，换镜像只走显式「升级」
@@ -699,6 +675,7 @@ app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  if (inst.appType === 'chromium') return reply.code(410).send({ error: RETIRED_MESSAGE });
   if (upgradeAllState.running) return reply.code(409).send({ error: '「一键升级全部实例」进行中，请等它完成' });
   if (upgradingIds.has(inst.id)) return reply.code(409).send({ error: '该实例已在升级中' });
   upgradingIds.add(inst.id);
@@ -711,8 +688,7 @@ app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
       appendPanelLog('ERROR', `升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     } finally {
       upgradingIds.delete(inst.id);
-      // 没有其他升级在跑时顺手回收旧版本镜像（含带 tag 的历史版本，非仅悬空）
-      if (!upgradingIds.size && !upgradeAllState.running) void pruneOldWocImages();
+      // Retain old images for an explicitly reviewed rollback.
     }
   })();
   return { ok: true, started: true };
@@ -755,12 +731,8 @@ app.post('/api/admin/instances/upgrade-all', async (req, reply) => {
   upgradeAllState = { running: true, total: 0, done: 0, failed: 0, phase: '拉取最新实例镜像…' };
   void (async () => {
     try {
-      // ① 统一拉取一次（失败不阻断：用本地已有镜像重建）
-      try {
-        await pullImage();
-      } catch (e: any) {
-        appendPanelLog('WARN', `一键升级：拉取镜像失败（${e?.message || e}），改用本地镜像重建`);
-      }
+      // ① 统一拉取并校验一次，失败立即停止。
+      await pullImage();
       // ② 拉取后再判定落后清单
       const latestId = await latestInstanceImageId();
       if (!latestId) {
@@ -790,8 +762,10 @@ app.post('/api/admin/instances/upgrade-all', async (req, reply) => {
         upgradeAllState.done++;
       }
       appendPanelLog('INFO', `一键升级全部实例完成：成功 ${upgradeAllState.done - upgradeAllState.failed}、失败 ${upgradeAllState.failed}`);
-      // ④ 升级后清理旧版本镜像（含带 tag 的历史版本）防磁盘堆积
-      await pruneOldWocImages();
+      // Retain old images for rollback.
+    } catch (e: any) {
+      upgradeAllState.failed++;
+      appendPanelLog('ERROR', `定制镜像升级失败：${e?.message || e}`);
     } finally {
       upgradeAllState = { ...upgradeAllState, running: false, phase: '' };
     }
@@ -1169,6 +1143,7 @@ app.get('/api/instances/:id/wechat/status', async (req, reply) => {
 async function triggerInstanceWechat(id: string, cmd: 'install' | 'update', reply: FastifyReply) {
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  if (inst.appType === 'chromium') return reply.code(410).send({ error: RETIRED_MESSAGE });
   try {
     await triggerWechat(inst, cmd);
     appendPanelLog('INFO', `实例「${inst.name}」(id=${id}) 触发${cmd === 'install' ? '下载安装' : '更新'}应用`);
@@ -1573,12 +1548,13 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
   });
 });
 
-// 版本兜底：若面板偏好的「同版本实例镜像 tag」不可达则回退 :latest（见 docker.ts）。
+// 显式定制镜像配置；实际启动/拉取路径必须通过身份校验。
 // 须在实例检测/升级/启动之前解析好，否则升级指示器会因指向不存在的 tag 而恒空。
 await resolveInstanceImage().catch(() => {});
 // 探测面板网络 + 重启后把已登记实例的容器拉起来
 await ensureNetwork().catch(() => {});
 for (const pub of listInstances()) {
+  if (pub.appType === 'chromium') continue;
   try {
     await ensureRunning(findInstance(pub.id)!);
   } catch (e: any) {
@@ -1586,10 +1562,7 @@ for (const pub of listInstances()) {
   }
 }
 
-// 启动时清一次旧版本 woc 镜像：面板自更新会留下旧的 woc-panel 镜像（helper 用新镜像重建面板后，
-// 旧镜像不再被任何容器引用，但带 tag 不是 dangling，清不掉）——在这里回收，也作为周期性兜底。
-// 延迟 30s 执行，避开启动高峰（拉实例镜像 / 起容器）。
-setTimeout(() => void pruneOldWocImages(), 30_000).unref();
+// Keep previous release images for explicit rollback.
 
 // Watchdog：KasmVNC/Xvnc 长跑会泄漏（实测 24h 可达 ~9 GiB），小内存机器会被拖垮。
 // 两档阈值，按"是否有人在用"决定时机：
@@ -1653,6 +1626,7 @@ if (WATCHDOG_ENABLED) {
 
   const tick = async () => {
     for (const pub of listInstances()) {
+      if (pub.appType === 'chromium') continue;
       const inst = findInstance(pub.id);
       if (!inst || recovering.has(inst.id)) continue;
       try {

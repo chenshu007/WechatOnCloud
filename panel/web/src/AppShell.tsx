@@ -4,7 +4,7 @@ import { useAuth } from './auth';
 import { useUI, PasswordInput } from './ui';
 import { api, appProfile, type InstanceWithStatus } from './api';
 import { InstanceIcon } from './AppIcon';
-import { getThemeMode, applyThemeMode, nextThemeMode, resolveDark, type ThemeMode } from './theme';
+import { getThemeMode, applyThemeMode, nextThemeMode, type ThemeMode } from './theme';
 import InstanceView from './pages/Desktop';
 import Admin from './pages/Admin';
 
@@ -47,6 +47,7 @@ function useInstancesLoader(): InstancesState {
 
 // 实例状态点（颜色 + 文案）
 export function statusOf(inst: InstanceWithStatus): { cls: string; text: string } {
+  if (inst.appType === 'chromium') return { cls: 'st-off', text: 'retired · 数据保留' };
   const offline = inst.runtime !== 'running';
   if (offline) return { cls: 'st-off', text: inst.runtime === 'missing' ? '未创建' : '已停止' };
   if (BUSY.includes(inst.wechat.phase)) return { cls: 'st-busy', text: '处理中' };
@@ -263,62 +264,17 @@ const themeIcon: Record<ThemeMode, JSX.Element> = {
     </svg>
   ),
 };
-// 主题开关：统一控制「面板」+「实例桌面」深色。面板部分立即生效（本地 CSS）；实例部分仅管理员可改
-// （服务端持久化 + 对运行中实例 docker exec 实时切换；非管理员只切自己的面板观感，不动实例）。
+// 面板本地主题，不同步到实例。
 function ThemeToggle() {
-  const { user } = useAuth();
-  const isAdmin = user?.role === 'admin';
   const [mode, setMode] = useState<ThemeMode>(() => getThemeMode());
-
-  // 让实例桌面跟随面板主题。dark = 该模式解析后的实际明暗（auto 按系统）。best-effort，失败忽略。
-  const pushDesktop = (dark: boolean) => {
-    if (!isAdmin) return;
-    api.setDesktopTheme(dark).catch(() => {});
-  };
-
-  // 登录/进入主页时对齐一次：仅当实例当前明暗与面板主题不一致才下发，避免无谓的 exec。
-  useEffect(() => {
-    if (!isAdmin) return;
-    let alive = true;
-    (async () => {
-      try {
-        const want = resolveDark(getThemeMode());
-        const { dark } = await api.getDesktopTheme();
-        if (alive && dark !== want) await api.setDesktopTheme(want);
-      } catch {
-        /* ignore */
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [isAdmin]);
-
-  // 跟随系统时，系统亮暗变化也要带动实例。
-  useEffect(() => {
-    if (!isAdmin || mode !== 'auto') return;
-    let mq: MediaQueryList;
-    try {
-      mq = window.matchMedia('(prefers-color-scheme: dark)');
-    } catch {
-      return;
-    }
-    const on = () => pushDesktop(mq.matches);
-    mq.addEventListener?.('change', on);
-    return () => mq.removeEventListener?.('change', on);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin, mode]);
 
   const cycle = () => {
     const m = nextThemeMode(mode);
     applyThemeMode(m);
     setMode(m);
-    pushDesktop(resolveDark(m));
   };
   const label = mode === 'auto' ? '跟随系统' : mode === 'light' ? '亮色' : '深色';
-  const hint = isAdmin
-    ? `主题：${label}（面板即时换肤；浏览器实例重启后跟随。点击循环：跟随系统 / 亮色 / 深色）`
-    : `主题：${label}（点击切换：跟随系统 / 亮色 / 深色）`;
+  const hint = `主题：${label}（点击切换：跟随系统 / 亮色 / 深色）`;
   return (
     <button className="theme-toggle" onClick={cycle} title={hint} aria-label={`主题：${label}`}>
       {themeIcon[mode]}

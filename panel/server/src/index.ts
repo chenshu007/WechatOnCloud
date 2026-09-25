@@ -1,3 +1,4 @@
+import { createLoginRateLimiter } from './login-rate-limit.js';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import fstatic from '@fastify/static';
@@ -167,12 +168,23 @@ function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
 // Compose 健康检查不依赖用户会话，仅暴露构建身份与存活状态。
 app.get('/api/health', async () => ({ ok: true, version: CURRENT_VERSION, revision: BUILD_REVISION || null }));
 
+const loginRateLimiter = createLoginRateLimiter();
 app.post('/api/auth/login', async (req, reply) => {
   const { username, password } = (req.body as any) ?? {};
+  if (typeof username !== 'string' || username.length > 256 || typeof password !== 'string' || password.length > 4096) {
+    return reply.code(400).send({ error: '登录参数不合法' });
+  }
+  const ip = req.raw.socket.remoteAddress || 'unknown'; // never req.ip / XFF / CF headers
+  const retryAfter = loginRateLimiter.check(ip, username);
+  if (retryAfter) return reply.header('Retry-After', String(retryAfter)).code(429).send({ error: '登录失败次数过多，请稍后重试' });
+  // Verification and counter update are synchronous: concurrent requests cannot
+  // all pass the budget check before recording their failure.
   const u = username ? findByUsername(username) : undefined;
-  if (!u || u.disabled || !verifyPassword(u, password ?? '')) {
+  if (!u || u.disabled || !verifyPassword(u, password)) {
+    loginRateLimiter.fail(ip, username);
     return reply.code(401).send({ error: '用户名或密码错误' });
   }
+  loginRateLimiter.success(ip, username);
   const token = createSession(u.id);
   reply.setCookie(COOKIE, token, {
     httpOnly: true,

@@ -1,3 +1,5 @@
+import { tarEntry, parseTransferFiles } from './transfer-format.js';
+import { StringDecoder } from 'node:string_decoder';
 import { hostname } from 'node:os';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, readPanelLog, filterSince } from './logs.js';
@@ -503,10 +505,15 @@ async function execCapture(inst: Instance, cmd: string[], user = 'abc'): Promise
   return await new Promise<string>((resolve, reject) => {
     let out = '';
     let err = '';
-    const stdout = { write: (b: Buffer) => { out += b.toString('utf8'); } } as any;
-    const stderr = { write: (b: Buffer) => { err += b.toString('utf8'); } } as any;
+    // Docker may split a UTF-8 filename across frames; decode after reassembly.
+    const outDecoder = new StringDecoder('utf8');
+    const errDecoder = new StringDecoder('utf8');
+    const stdout = { write: (b: Buffer) => { out += outDecoder.write(b); } } as any;
+    const stderr = { write: (b: Buffer) => { err += errDecoder.write(b); } } as any;
     docker.modem.demuxStream(stream, stdout, stderr);
     stream.on('end', async () => {
+      out += outDecoder.end();
+      err += errDecoder.end();
       try {
         const info = await exec.inspect();
         if (info.ExitCode && info.ExitCode !== 0) {
@@ -616,45 +623,10 @@ const TRANSFER_DIR = '/config/Desktop';
 
 // 极简单文件 tar 编码（putArchive 需要 tar；避免引入第三方依赖）。
 function tarSingleFile(name: string, content: Buffer): Buffer {
-  const h = Buffer.alloc(512, 0);
-  h.write(name.slice(0, 100), 0, 'utf8'); // name
-  h.write('0000644\0', 100); // mode
-  h.write('0001750\0', 108); // uid 1000(octal 1750)
-  h.write('0001750\0', 116); // gid 1000
-  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124); // size
-  h.write('00000000000\0', 136); // mtime
-  h.write('        ', 148); // checksum 占位（8 空格）
-  h.write('0', 156); // typeflag 普通文件
-  h.write('ustar\0', 257);
-  h.write('00', 263);
-  let sum = 0;
-  for (let i = 0; i < 512; i++) sum += h[i];
-  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148); // 真实校验和
-  const pad = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([h, content, Buffer.alloc(pad, 0), Buffer.alloc(1024, 0)]);
+  return Buffer.concat([tarEntry(name, content), Buffer.alloc(1024)]);
 }
 
 // ---------- 诊断包 ----------
-// 单个 tar entry（USTAR header + 内容 + 512 对齐填充），复用与 tarSingleFile 相同的格式。
-function tarEntry(name: string, content: Buffer): Buffer {
-  const h = Buffer.alloc(512, 0);
-  h.write(name.slice(0, 100), 0, 'utf8');
-  h.write('0000644\0', 100);
-  h.write('0001750\0', 108);
-  h.write('0001750\0', 116);
-  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124);
-  h.write('00000000000\0', 136);
-  h.write('        ', 148); // checksum 占位
-  h.write('0', 156); // typeflag 普通文件
-  h.write('ustar\0', 257);
-  h.write('00', 263);
-  let sum = 0;
-  for (let i = 0; i < 512; i++) sum += h[i];
-  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
-  const pad = (512 - (content.length % 512)) % 512;
-  return Buffer.concat([h, content, Buffer.alloc(pad, 0)]);
-}
-
 // 多文件 tar.gz（内存构建；诊断包通常仅数 MB）。文件名用 ASCII 路径避免 utf8 超 100 字节。
 function buildTarGz(entries: { name: string; content: string | Buffer }[]): Buffer {
   const parts = entries.map((e) => tarEntry(e.name, Buffer.isBuffer(e.content) ? e.content : Buffer.from(e.content, 'utf8')));
@@ -806,20 +778,13 @@ export async function uploadToInstance(inst: Instance, name: string, content: Bu
 export interface TransferFile {
   name: string;
   size: number;
+  mtime?: number; // Unix seconds; additive field for older clients
 }
 export async function listInstanceFiles(inst: Instance): Promise<TransferFile[]> {
   const out = await execCapture(inst, [
-    'sh',
-    '-c',
-    `find ${TRANSFER_DIR} -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null`,
+    'find', TRANSFER_DIR, '-maxdepth', '1', '-type', 'f', '-printf', '%f\\0%s\\0%T@\\0',
   ]);
-  return out
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      const [name, size] = line.split('\t');
-      return { name, size: Number(size) || 0 };
-    });
+  return parseTransferFiles(out);
 }
 
 export async function deleteInstanceFile(inst: Instance, name: string): Promise<void> {

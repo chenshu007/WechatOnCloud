@@ -1,3 +1,4 @@
+import { fatalErrorMsg } from '../vnc-errors';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, appProfile } from '../api';
@@ -98,18 +99,6 @@ function humanSize(n: number) {
 // KasmVNC/noVNC 客户端 bundle 偶发未捕获异常（实测长时间空闲后报 "Cannot read properties of undefined
 // (reading 'lastActiveAt')"），会弹出其致命错误浮层（#noVNC_fallback_error 加 .noVNC_open）并卡死桌面，
 // 此时底层 ws 已死、自带重连也救不回。返回错误文案以便记日志；无致命错误则返回 null。
-function fatalErrorMsg(doc: Document | null | undefined): string | null {
-  try {
-    const el = doc?.getElementById('noVNC_fallback_error');
-    if (el && el.classList.contains('noVNC_open')) {
-      return doc?.getElementById('noVNC_fallback_errormsg')?.textContent?.trim() || 'KasmVNC 致命错误';
-    }
-  } catch {
-    /* 同源正常不会到这 */
-  }
-  return null;
-}
-
 // 致命崩溃自愈限频：同一实例 5 分钟内最多自动重连 4 次，超限改走手动恢复，杜绝"崩溃→重载→又崩"的死循环。
 function allowAutoRecover(iid: string): boolean {
   const key = `woc_fatal_${iid}`;
@@ -231,6 +220,12 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const lastBeat = useRef(0);
   const audioRef = useRef<VncAudio | null>(null);
   const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
+  const extensionErrorLogged = useRef(false);
+  const onExtensionError = () => {
+    if (extensionErrorLogged.current || !id) return;
+    extensionErrorLogged.current = true;
+    api.clientLog(id, '忽略浏览器扩展误报：VNC 仍连接，不重载');
+  };
 
   const inst = instances.find((i) => i.id === id);
   const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Telegram…）
@@ -511,7 +506,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     let lastState = '';
     const t = window.setInterval(() => {
       const doc = frameRef.current?.contentDocument;
-      const fatal = fatalErrorMsg(doc);
+      const fatal = fatalErrorMsg(doc, onExtensionError);
       if (fatal) {
         recoverFromFatal(fatal);
         return;
@@ -549,18 +544,20 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!win) return;
     const onErr = () => {
       window.setTimeout(() => {
-        const msg = fatalErrorMsg(frameRef.current?.contentDocument);
+        const msg = fatalErrorMsg(frameRef.current?.contentDocument, onExtensionError);
         if (msg) recoverFromFatal(msg);
       }, 400);
     };
     try {
       win.addEventListener('error', onErr);
+      win.addEventListener('unhandledrejection', onErr);
     } catch {
       return;
     }
     return () => {
       try {
         win.removeEventListener('error', onErr);
+        win.removeEventListener('unhandledrejection', onErr);
       } catch {
         /* ignore */
       }

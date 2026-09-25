@@ -1,3 +1,4 @@
+import { createGatewayFetch } from './gateway-fetch';
 export interface PanelUser {
   id: string;
   username: string;
@@ -86,85 +87,18 @@ export interface VersionInfo {
   error: string | null; // 检查失败原因
 }
 
-const ACCESS_REAUTH_STATE = 'woc_access_reauth_state';
-const ACCESS_REAUTH_MESSAGE = '访问会话已失效，正在重新验证…';
-const ACCESS_REAUTH_WINDOW_MS = 60_000;
-const ACCESS_REAUTH_COOLDOWN_MS = 8_000;
-const ACCESS_REAUTH_MAX_ATTEMPTS = 2;
-
-interface AccessReauthState {
-  attempts: number;
-  lastAttemptAt: number;
-}
-
-function isSameOriginApi(input: RequestInfo | URL) {
-  const url = typeof input === 'string' || input instanceof URL ? input.toString() : input.url;
-  const parsed = new URL(url, window.location.origin);
-  return parsed.origin === window.location.origin && parsed.pathname.startsWith('/api/');
-}
-
-function readAccessReauthState(now: number): AccessReauthState {
-  try {
-    const parsed = JSON.parse(sessionStorage.getItem(ACCESS_REAUTH_STATE) || '{}') as Partial<AccessReauthState>;
-    const lastAttemptAt = Number(parsed.lastAttemptAt || 0);
-    if (!lastAttemptAt || now - lastAttemptAt > ACCESS_REAUTH_WINDOW_MS) {
-      return { attempts: 0, lastAttemptAt: 0 };
-    }
-    return { attempts: Number(parsed.attempts || 0), lastAttemptAt };
-  } catch {
-    return { attempts: 0, lastAttemptAt: 0 };
-  }
-}
-
-function clearAccessReauthState() {
-  try {
-    sessionStorage.removeItem(ACCESS_REAUTH_STATE);
-  } catch {}
-  const url = new URL(window.location.href);
-  if (url.searchParams.has('woc_access_reauth')) {
-    url.searchParams.delete('woc_access_reauth');
-    window.history.replaceState(window.history.state, '', url.toString());
-  }
-}
-
-function isAbortError(err: unknown) {
-  return typeof err === 'object' && err !== null && 'name' in err && (err as { name?: string }).name === 'AbortError';
-}
-
-function redirectForAccessReauth(err: unknown) {
-  if (!(err instanceof TypeError) || isAbortError(err) || !navigator.onLine || document.visibilityState === 'hidden') {
-    return false;
-  }
-
-  const now = Date.now();
-  const state = readAccessReauthState(now);
-  if (state.attempts >= ACCESS_REAUTH_MAX_ATTEMPTS || now - state.lastAttemptAt < ACCESS_REAUTH_COOLDOWN_MS) {
-    return false;
-  }
-  try {
-    sessionStorage.setItem(ACCESS_REAUTH_STATE, JSON.stringify({ attempts: state.attempts + 1, lastAttemptAt: now }));
-  } catch {}
-
-  // Fetch cannot follow Cloudflare Access' cross-origin login redirect because the browser
-  // blocks it as CORS. A top-level navigation lets Access re-authenticate and then return here.
-  const url = new URL(window.location.href);
-  url.searchParams.set('woc_access_reauth', String(now));
-  window.location.replace(url.toString());
-  return true;
-}
-
-async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
-  try {
-    const response = await fetch(input, init);
-    clearAccessReauthState();
-    return response;
-  } catch (err) {
-    if (isSameOriginApi(input) && redirectForAccessReauth(err)) {
-      throw new Error(ACCESS_REAUTH_MESSAGE);
-    }
-    throw err;
-  }
-}
+const apiFetch = createGatewayFetch({
+  fetch: (input, init) => fetch(input, init),
+  now: () => Date.now(),
+  url: () => window.location.href,
+  online: () => navigator.onLine,
+  visible: () => document.visibilityState !== 'hidden',
+  read: (key) => sessionStorage.getItem(key),
+  write: (key, value) => sessionStorage.setItem(key, value),
+  remove: (key) => sessionStorage.removeItem(key),
+  navigate: (url) => window.location.replace(url),
+  replaceUrl: (url) => window.history.replaceState(window.history.state, '', url),
+});
 
 // 原始二进制上传（File 直传 application/octet-stream），用于数据卷上传/解压/恢复
 async function rawUpload(url: string, file: File): Promise<any> {
@@ -281,7 +215,7 @@ export const api = {
   panelLogUrl: (range: string) => `/api/admin/panel-log?range=${encodeURIComponent(range)}`,
 
   // 文件中转
-  listFiles: (id: string) => req<{ files: { name: string; size: number }[] }>(`/api/instances/${id}/files`),
+  listFiles: (id: string) => req<{ files: { name: string; size: number; mtime?: number }[] }>(`/api/instances/${id}/files`),
   uploadFile: async (id: string, file: File) => {
     const res = await apiFetch(`/api/instances/${id}/upload?name=${encodeURIComponent(file.name)}`, {
       method: 'POST',

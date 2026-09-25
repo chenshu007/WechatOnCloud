@@ -142,3 +142,6 @@ dist
 /.claude
 .DS_Store
 /scratchpad
+
+# Local regression cache
+__pycache__/

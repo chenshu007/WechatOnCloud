@@ -1,0 +1,174 @@
+name: no-chromium-sync
+on:
+  workflow_dispatch:
+  # Disabled by default. Only enable after no-chromium becomes the default branch.
+  # schedule:
+  #   - cron: '23 4 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: no-chromium-sync
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'chenshu007/WechatOnCloud' && github.ref == 'refs/heads/no-chromium'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      tag: ${{ steps.result.outputs.tag }}
+      branch: ${{ steps.result.outputs.branch }}
+      sha: ${{ steps.result.outputs.sha }}
+      base: ${{ steps.result.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: no-chromium
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Git identity for local merge candidates
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Discover stable release, deduplicate existing remote candidate
+        id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/sync-upstream.py --output "$RUNNER_TEMP/discovery.json"
+          branch=$(jq -r '.branch // empty' "$RUNNER_TEMP/discovery.json")
+          if [ -n "$branch" ] && [ -n "$(git ls-remote origin "refs/heads/$branch")" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Normal merge plus local regression checks (read-only token; no secrets)
+        id: merge
+        if: steps.discover.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/sync-upstream.py --apply --output "$RUNNER_TEMP/result.json"
+      - name: Capture exact candidate and status even on conflict/test failure
+        id: result
+        if: always()
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/result.json"
+          if [ ! -f "$result" ]; then
+            cp "$RUNNER_TEMP/discovery.json" "$result"
+            jq '.status="existing"' "$result" > "$RUNNER_TEMP/existing.json"
+            mv "$RUNNER_TEMP/existing.json" "$result"
+          fi
+          jq -r '"status=\(.status)","tag=\(.tag // "")","branch=\(.branch // "")","sha=\(.candidate_sha // "")","base=\(.maintenance_sha // "")"' "$result" >> "$GITHUB_OUTPUT"
+          if [ "$(jq -r .status "$result")" = validated ]; then
+            branch=$(jq -r .branch "$result")
+            git bundle create "$RUNNER_TEMP/candidate.bundle" "refs/heads/$branch"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-candidate
+          path: |
+            ${{ runner.temp }}/candidate.bundle
+            ${{ runner.temp }}/result.json
+          retention-days: 14
+  images:
+    needs: prepare
+    if: needs.prepare.outputs.status == 'validated'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: no-chromium
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Check out exactly the validated candidate SHA
+        env:
+          CANDIDATE: ${{ needs.prepare.outputs.sha }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: |
+          git fetch "$RUNNER_TEMP/candidate/candidate.bundle" "refs/heads/$BRANCH"
+          test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE"
+          git checkout --detach "$CANDIDATE"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and smoke both images without publishing
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          WOC_PLATFORM: linux/${{ matrix.arch }}
+          WOC_TEST_DOCKER_ALLOWED: '1'
+        run: WOC_VERSION="${TAG#v}-no-chromium.1" bash scripts/build-local.sh
+  propose:
+    needs: [prepare, images]
+    if: needs.prepare.outputs.status == 'validated' && needs.images.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # This job NEVER checks out or executes candidate code.
+      - uses: actions/checkout@v4
+        with:
+          ref: no-chromium
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Push only the checked SHA and prepare a draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.prepare.outputs.sha }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE"
+          git fetch "$RUNNER_TEMP/candidate/candidate.bundle" "refs/heads/$BRANCH"
+          test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE"
+          git merge-base --is-ancestor "$BASE" "$CANDIDATE"
+          gh auth setup-git
+          git push origin "$CANDIDATE:refs/heads/$BRANCH"
+          if [ "$(gh pr list --head "$BRANCH" --base no-chromium --state all --json number --jq length)" = 0 ]; then
+            printf 'Merge upstream %s into no-chromium.\n\nValidated candidate: %s\nBoth native image builds and smoke checks ran in this workflow. No images published or deployment performed. Review the diff and approve any separately queued PR CI runs.\n' "$TAG" "$CANDIDATE" > "$RUNNER_TEMP/pr.md"
+            gh pr create --draft --base no-chromium --head "$BRANCH" --title "Sync $TAG (no-Chromium)" --body-file "$RUNNER_TEMP/pr.md"
+          fi
+  failure:
+    needs: [prepare, images]
+    if: always() && (needs.prepare.result == 'failure' || needs.images.result == 'failure') && needs.prepare.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: One failure issue per upstream version (no candidate code execution)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          title="no-Chromium sync failed: $TAG"
+          # Exact title check; no repeated comments/notifications for the same version.
+          gh issue list --state all --search "\"$title\" in:title" --json title > "$RUNNER_TEMP/issues.json"
+          if ! jq -e --arg title "$title" 'any(.[]; .title == $title)' "$RUNNER_TEMP/issues.json" >/dev/null; then
+            printf 'Sync validation failed. Inspect the workflow logs and conflict files; resolve manually. Maintenance branch, published images and NAS are unchanged.\n' > "$RUNNER_TEMP/failure.md"
+            gh issue create --title "$title" --body-file "$RUNNER_TEMP/failure.md"
+          fi

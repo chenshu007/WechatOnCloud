@@ -1,3 +1,7 @@
+> **此维护分支为 no-Chromium 下游版。** 独立浏览器已退役，微信与 WeChatAppEx 保留。
+> 首次构建、双镜像发布、稳定版同步、安全部署及回滚请先阅读 [维护指南](maintenance/README.md)。
+> 下方保留上游文档作为功能参考；其中通用 `latest`、浏览器、自更新部署说明不适用于本分支。
+
 <div align="center">
 
 <img src="doc/img/icon-192.png" width="88" height="88" alt="云微 logo" />

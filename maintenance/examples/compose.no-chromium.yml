@@ -1,0 +1,19 @@
+# Review-only overlay. Use AFTER both existing base Compose and secure overlay.
+# Do not copy over the NAS's Compose files or replace existing mounts/networks/ports.
+services:
+  panel:
+    image: ${WOC_PANEL_IMAGE:?Set verified ghcr.io/chenshu007/woc-panel@sha256 digest from pair receipt}
+    environment:
+      WOC_WECHAT_IMAGE: ${WOC_WECHAT_IMAGE:?Set verified ghcr.io/chenshu007/wechat-on-cloud@sha256 digest from pair receipt}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      WOC_DOCKER_NETWORK: ${WOC_DOCKER_NETWORK:?Set the existing instance network, never woc_proxy}
+      WOC_KEEP_OLD_IMAGES: '1'
+    volumes:
+      - /dev/null:/var/run/docker.sock
+    networks:
+      - default
+      - woc_proxy
+    depends_on:
+      - docker-socket-proxy
+  docker-socket-proxy:
+    image: ${WOC_SOCKET_PROXY_IMAGE:?Preserve the approved existing socket proxy digest}

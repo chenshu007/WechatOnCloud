@@ -1703,7 +1703,7 @@ function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus;
           <div className="vol-section-label">整卷备份 / 恢复</div>
           <div className="vol-topbar">
             <a className="btn" href={api.volumeBackupUrl(inst.id)} target="_blank" rel="noreferrer">下载整卷备份</a>
-            <button className="btn" disabled={disabled} onClick={() => restoreRef.current?.click()}>恢复备份…</button>
+            <button className="btn" disabled={disabled || inst.appType === 'chromium'} onClick={() => restoreRef.current?.click()}>恢复备份…</button>
             <input ref={restoreRef} type="file" accept=".gz,.tgz,.tar" hidden onChange={onPick('restore')} />
           </div>
           <div className="vol-hint">整卷含聊天记录，用于跨实例迁移 / 离线备份。</div>
@@ -1711,7 +1711,9 @@ function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus;
 
         {offline ? (
           <div className="vol-warn">
-            实例未运行，文件浏览不可用。可执行上方的整卷备份 / 恢复；要浏览或上传单个文件，请先在卡片上启动实例。
+            {inst.appType === 'chromium'
+              ? '此实例已退役，不能重新启动。数据保留，可下载整卷备份，或返回管理卡片显式删除。'
+              : '实例未运行，文件浏览不可用。可执行上方的整卷备份 / 恢复；要浏览或上传单个文件，请先在卡片上启动实例。'}
           </div>
         ) : (
           <div className="vol-sec">

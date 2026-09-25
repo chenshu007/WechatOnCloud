@@ -12,11 +12,10 @@ RUN set -eux; \
     # 中文字体（否则界面/消息显示方块）+ 语言环境 + 下载/解压工具
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        curl ca-certificates locales dpkg \
+        curl ca-certificates locales dpkg util-linux \
         fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
         libnss3 libgbm1 libasound2 libxss1 \
         xz-utils \
-        chromium \
         xdotool xclip \
         xwallpaper xsettingsd; \
     sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \

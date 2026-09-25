@@ -26,14 +26,3 @@ export function applyThemeMode(m: ThemeMode): void {
 export function nextThemeMode(m: ThemeMode): ThemeMode {
   return m === 'auto' ? 'light' : m === 'light' ? 'dark' : 'auto';
 }
-
-// 把主题模式解析成"实际是不是深色"（auto 按系统媒体查询判定）。实例只有深/浅两态，故用此布尔下发。
-export function resolveDark(m: ThemeMode): boolean {
-  if (m === 'dark') return true;
-  if (m === 'light') return false;
-  try {
-    return window.matchMedia('(prefers-color-scheme: dark)').matches;
-  } catch {
-    return false;
-  }
-}

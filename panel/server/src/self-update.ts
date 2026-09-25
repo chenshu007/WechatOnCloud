@@ -27,6 +27,8 @@ function pull(ref: string): Promise<void> {
   });
 }
 
+const IMAGE_IDENTITY_ENV = new Set(['WOC_VERSION']);
+
 function envToMap(env?: string[] | null): Map<string, string> {
   const m = new Map<string, string>();
   for (const e of env || []) {
@@ -37,19 +39,20 @@ function envToMap(env?: string[] | null): Map<string, string> {
 }
 
 // 由旧容器 inspect + 目标镜像，构造重建用的 create 选项（含 env-diff 与网络）。
-async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.ContainerCreateOptions> {
+export async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.ContainerCreateOptions> {
   const newImg: any = await docker.getImage(imageRef).inspect();
   let oldBaked = new Map<string, string>();
   try {
     const oldImg: any = await docker.getImage(self.Image).inspect(); // self.Image = 旧镜像 id
     oldBaked = envToMap(oldImg.Config?.Env);
   } catch {
-    /* 旧镜像可能已被新 tag 覆盖且无法 inspect：oldBaked 为空，下面会多带几个 baked env，无害 */
+    /* 旧镜像不可读：保留运行时变量，但镜像身份仍只取新镜像 baked 值。 */
   }
   const newBaked = envToMap(newImg.Config?.Env);
   const containerEnv = envToMap(self.Config?.Env);
   const finalEnv = new Map(newBaked); // 起步：新镜像 baked（含新 WOC_VERSION）
   for (const [k, v] of containerEnv) {
+    if (IMAGE_IDENTITY_ENV.has(k)) continue;
     // compose 注入或覆盖的（旧镜像没有该 key，或容器值与旧 baked 不同）→ 保留
     if (!oldBaked.has(k) || oldBaked.get(k) !== v) finalEnv.set(k, v);
   }

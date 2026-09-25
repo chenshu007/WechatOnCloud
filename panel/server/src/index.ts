@@ -30,8 +30,6 @@ import {
   setInstanceIcon,
   setInstanceUsers,
   publicInstance,
-  getDesktopDark,
-  setDesktopDark,
   APP_TYPES,
   type AppType,
   type User,
@@ -91,6 +89,7 @@ import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard
 import { BUILD_REVISION, CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
+import { createVncRejectLimiter, type VncRejectReason } from './vnc-reject.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -220,23 +219,6 @@ app.post('/api/admin/version/self-update', async (req, reply) => {
     appendPanelLog('ERROR', `面板自更新失败：${e?.message || e}`);
     return reply.code(500).send({ error: '更新失败：' + (e?.message || e) });
   }
-});
-
-// ---------- 实例桌面深色（与面板主题统一的那个开关）----------
-// 读取当前实例深色状态（任何登录用户可读，用于前端同步主题开关与实例的一致性）。
-app.get('/api/desktop-theme', async (req, reply) => {
-  if (!requireAuth(req, reply)) return;
-  return { dark: getDesktopDark() };
-});
-// 设置实例深色（管理员）。面板顶栏主题开关切到 深/浅 时调用：持久化即可。它作为浏览器(Chromium)实例
-// 启动时的明暗（经 envList → WOC_DARK 下发，autostart 据此加 --force-dark-mode），故**重启实例后生效**，
-// 不做在线切换（极简容器内无稳定的桌面 portal，微信也不跟随，详见 docker/autostart 注释）。
-app.post('/api/admin/desktop-theme', async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
-  const dark = !!(req.body as any)?.dark;
-  setDesktopDark(dark);
-  appendPanelLog('INFO', `实例深色设为 ${dark ? '深色' : '浅色'}（浏览器实例重启后生效）`);
-  return { ok: true, dark };
 });
 
 // ---------- 自助改密 ----------
@@ -371,7 +353,7 @@ app.post('/api/instances/:id/heal', async (req, reply) => {
   lastHealAt.set(id, now);
   appendPanelLog('WARN', `实例「${inst.name}」(id=${id}) 由 ${u.username} 触发卡死自愈（VNC 连不上 → 重启容器，数据保留）`);
   try {
-    await runInstance(inst);
+    await runInstance(inst, { keepImage: true });
     return { ok: true, restarted: true };
   } catch (e: any) {
     appendPanelLog('ERROR', `实例「${inst.name}」(id=${id}) 卡死自愈重启失败：${e?.message || e}`);
@@ -401,7 +383,10 @@ app.post('/api/admin/instances', async (req, reply) => {
   if (!name || String(name).trim().length === 0 || String(name).length > 30) {
     return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
   }
-  const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
+  if (appType !== undefined && !APP_TYPES.includes(appType)) {
+    return reply.code(400).send({ error: '不支持的应用类型' });
+  }
+  const type: AppType = appType ?? 'wechat';
   // 复用卷：必须以 woc-data- 开头，且不能被现存实例占用。后端先校验，避免坏名穿透到 docker run。
   let reuseVolumeName: string | undefined;
   if (reuseVolume) {
@@ -622,14 +607,14 @@ app.post('/api/admin/instances/:id/stop', async (req, reply) => {
   }
 });
 
-// 重启实例容器（仅管理员）：按当前本地镜像重建（保留数据卷 → 登录态不丢；快速，不联网拉取）。
+// 重启实例容器（仅管理员）：沿用该容器的镜像 ID，不拉取或切换版本。
 app.post('/api/admin/instances/:id/restart', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     appendPanelLog('INFO', `重启实例「${inst.name}」(id=${inst.id})`);
-    await runInstance(inst);
+    await runInstance(inst, { keepImage: true });
     return { ok: true };
   } catch (e: any) {
     appendPanelLog('ERROR', `重启实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
@@ -1174,17 +1159,51 @@ app.post('/api/admin/instances/:id/fonts/default', async (req, reply) => {
 // ---------- 反向代理到内网 KasmVNC（按实例注入 Basic auth，会话 + 权限把守） ----------
 // 单个 proxy 实例，target 与凭据逐请求指定：凭据暂存在 req 上，proxyReq 时注入。
 const proxy = httpProxy.createProxyServer({ changeOrigin: true, ws: true });
+// 控制权心跳只代表“最近有键鼠操作”，不能代表“桌面是否仍在观看”。Chrome 标签页进入后台后
+// 不再产生键鼠事件，但 VNC WebSocket 通常仍保持连接；watchdog 必须把这种连接视为活跃会话，
+// 否则实例一超过 soft 阈值就会被误重启，表现为切走页面后微信退出 / 桌面断线。
+const activeVncSockets = new Map<string, Set<Socket>>();
+
+function trackActiveVncSocket(instId: string, socket: Socket) {
+  let sockets = activeVncSockets.get(instId);
+  if (!sockets) {
+    sockets = new Set<Socket>();
+    activeVncSockets.set(instId, sockets);
+  }
+  if (sockets.has(socket)) return;
+  sockets.add(socket);
+  appendInstanceLog(instId, `[vnc] 活跃观看连接=${sockets.size}`);
+  socket.once('close', () => {
+    const current = activeVncSockets.get(instId);
+    if (!current) return;
+    current.delete(socket);
+    if (current.size === 0) activeVncSockets.delete(instId);
+    appendInstanceLog(instId, `[vnc] 活跃观看连接=${current.size}`);
+  });
+}
+
+function activeVncViewerCount(instId: string): number {
+  return activeVncSockets.get(instId)?.size ?? 0;
+}
+
 proxy.on('proxyReq', (proxyReq, req) => {
   const auth = (req as any)._wocAuth;
   if (auth) proxyReq.setHeader('authorization', auth);
 });
 proxy.on('proxyReqWs', (proxyReq, req) => {
+  req.socket?.setKeepAlive(true, 30_000);
+  proxyReq.on('socket', (upstreamSocket: Socket) => upstreamSocket.setKeepAlive(true, 30_000));
   const auth = (req as any)._wocAuth;
   if (auth) proxyReq.setHeader('authorization', auth);
   // 上游（实例 nginx → KasmVNC websockify）回 101 = ws 接收器接受了连接，桌面真正连上。
   // 卡死时这条不会出现（接收器停止 accept），即可定位"卡在面板→实例之间还是实例内部"。
   const instId = (req as any)._wocInstId;
-  if (instId) proxyReq.on('upgrade', () => appendInstanceLog(instId, '[vnc] 上游已接受(101) · 桌面连接建立'));
+  if (instId) {
+    proxyReq.on('upgrade', () => {
+      trackActiveVncSocket(instId, req.socket as Socket);
+      appendInstanceLog(instId, '[vnc] 上游已接受(101) · 桌面连接建立');
+    });
+  }
 });
 // 兜底：剥掉 KasmVNC 401 的 WWW-Authenticate 头，避免浏览器弹出原生 Basic Auth 登录框。
 // 正常路径下我们已注入正确凭据（不会 401）；万一凭据失配，宁可桌面加载失败也绝不把登录弹窗暴露给用户。
@@ -1308,30 +1327,45 @@ function parseCookies(header?: string): Record<string, string> {
   for (const part of header.split(';')) {
     const idx = part.indexOf('=');
     if (idx === -1) continue;
-    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    try {
+      out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    } catch {
+      // A malformed cookie must not throw out of the raw upgrade handler.
+    }
   }
   return out;
 }
 
+const shouldLogVncReject = createVncRejectLimiter();
 await app.ready();
 
 app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
+  const parsed = req.url ? parseDesktopUrl(req.url) : null;
+  const reject = (reason: VncRejectReason) => {
+    // Unknown client-supplied IDs are aggregated and never create log files.
+    const id = parsed && findInstance(parsed.id) ? parsed.id : '-';
+    if (shouldLogVncReject(id, reason)) {
+      if (id !== '-') appendInstanceLog(id, `[vnc] 连接被拒：${reason}`);
+      appendPanelLog('WARN', `[vnc] 连接被拒：${reason} instance=${id}`);
+    }
+    socket.destroy();
+  };
   // DNS-rebinding gate for WebSocket upgrades (Fastify's onRequest hook does
   // not run on raw upgrades). KasmVNC proxying goes through this path.
   if (!isRequestHostAllowed(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS)) {
-    socket.destroy();
+    reject('HOST_NOT_ALLOWED');
     return;
   }
-  const parsed = req.url ? parseDesktopUrl(req.url) : null;
   if (!parsed) {
-    socket.destroy();
+    reject('INVALID_URL');
     return;
   }
   const cookies = parseCookies(req.headers.cookie);
   const s = getSession(cookies[COOKIE]);
   const u = s && findById(s.userId);
   if (!u || u.disabled || !userCanAccess(u, parsed.id)) {
-    socket.destroy();
+    reject(!cookies[COOKIE] ? 'COOKIE_MISSING' : !s ? 'SESSION_INVALID' :
+      !u ? 'USER_MISSING' : u.disabled ? 'USER_DISABLED' : 'ACCESS_DENIED');
     return;
   }
   const inst = findInstance(parsed.id)!;
@@ -1372,10 +1406,18 @@ for (const pub of listInstances()) {
 //   WOC_WATCHDOG_INTERVAL_SEC   巡检间隔秒；默认 300（5 分钟），最小 60；0 关闭整个 watchdog
 //   WOC_WATCHDOG_HEALTH_FAILS   VNC 响应性探测：连续无响应几次才重启；默认 0=关闭该探测（仅保留内存自愈）
 const DEFAULT_SOFT_MB = Math.max(0, Number(process.env.WOC_INSTANCE_MEM_SOFT_MB ?? 1500));
-const DEFAULT_HARD_MB = Math.max(
+const CONFIGURED_HARD_MB = Math.max(
   0,
   Number(process.env.WOC_INSTANCE_MEM_HARD_MB ?? process.env.WOC_INSTANCE_MEM_LIMIT_MB ?? 2500),
 );
+const INSTANCE_MEM_LIMIT_MB = Math.max(0, Number(process.env.WOC_INSTANCE_MEM_GB || 0) * 1024);
+// cgroup 上限存在时，hard 阈值最多取其 90%，预留文件缓存和采样误差空间，避免阈值高于容器
+// 上限而永远无法触发（例如 2 GiB 容器配 2500 MiB hard）。0 仍表示显式关闭 hard。
+function clampHardLimit(hard: number): number {
+  if (hard <= 0 || INSTANCE_MEM_LIMIT_MB <= 0) return Math.max(0, hard);
+  return Math.min(hard, Math.floor(INSTANCE_MEM_LIMIT_MB * 0.9));
+}
+const DEFAULT_HARD_MB = clampHardLimit(CONFIGURED_HARD_MB);
 const WATCHDOG_INTERVAL_SEC = Math.max(60, Number(process.env.WOC_WATCHDOG_INTERVAL_SEC ?? 300));
 // VNC 响应性探测默认关闭（=0）。实测健康实例 ~1ms 响应，但偶发宿主级 CPU/IO 争用（如同机重 docker build）
 // 会让探测超时被误判为 stall 而重启正常实例，故默认不启用；需要时设为正整数 N（连续 N 次无响应才重启）开启。
@@ -1386,14 +1428,14 @@ const WATCHDOG_ENABLED = WATCHDOG_INTERVAL_SEC > 0 && (DEFAULT_SOFT_MB > 0 || DE
 function effectiveLimits(inst: Instance): { soft: number; hard: number } {
   return {
     soft: inst.memSoftLimitMB ?? DEFAULT_SOFT_MB,
-    hard: inst.memHardLimitMB ?? DEFAULT_HARD_MB,
+    hard: clampHardLimit(inst.memHardLimitMB ?? DEFAULT_HARD_MB),
   };
 }
 
-// "当前有人在远程会话" 启发式判定：复用控制权心跳。前端在用户鼠标/键盘/滚轮交互时 2.5s 节流 beat，
-// 故 holder 在 TTL 内即视为"有人在主动操作"。只看屏（不交互）超过 TTL 后会被判为空闲——这是有意的，
-// 软自愈宁愿在"看似空闲"时短暂打扰，也不要拖到 hard 强制重启。
+// “当前有人在远程会话”同时看两类信号：VNC WebSocket 表示仍在观看，控制权心跳表示最近
+// 有键鼠操作。Chrome 后台标签页会停止交互心跳，但只要桌面连接仍在，就不能做 soft 重启。
 function hasActiveSession(id: string): boolean {
+  if (activeVncViewerCount(id) > 0) return true;
   const h = controlHolders.get(id);
   return !!h && Date.now() - h.at <= CONTROL_TTL;
 }
@@ -1408,8 +1450,7 @@ if (WATCHDOG_ENABLED) {
     appendInstanceLog(inst.id, `[看门狗] 自愈重启（${reason}）：${detail}`);
     appendPanelLog('WARN', `[看门狗] 实例「${inst.name}」(id=${inst.id}) 自愈重启（${reason}）：${detail}`);
     try {
-      await stopInstance(inst);
-      await runInstance(inst);
+      await runInstance(inst, { keepImage: true });
       healthFails.delete(inst.id);
       app.log.info(`[watchdog] ${inst.containerName} 自愈完成（${reason}）`);
     } catch (e: any) {
@@ -1423,7 +1464,7 @@ if (WATCHDOG_ENABLED) {
   const tick = async () => {
     for (const pub of listInstances()) {
       const inst = findInstance(pub.id);
-      if (!inst || recovering.has(inst.id)) continue;
+      if (!inst || inst.appType === 'chromium' || recovering.has(inst.id)) continue;
       try {
         if ((await instanceRuntime(inst)) !== 'running') {
           healthFails.delete(inst.id);
@@ -1434,8 +1475,9 @@ if (WATCHDOG_ENABLED) {
         if (mb > 0) {
           const { soft, hard } = effectiveLimits(inst);
           const active = hasActiveSession(inst.id);
+          const viewers = activeVncViewerCount(inst.id);
           if (hard > 0 && mb >= hard) {
-            await recover(inst, 'hard', `mem=${mb}MiB ≥ hard=${hard}MiB，强制重启（active=${active}）`);
+            await recover(inst, 'hard', `mem=${mb}MiB ≥ hard=${hard}MiB，强制重启（active=${active}, viewers=${viewers}）`);
             continue;
           }
           if (soft > 0 && mb >= soft && !active) {
@@ -1443,7 +1485,7 @@ if (WATCHDOG_ENABLED) {
             continue;
           }
           if (soft > 0 && mb >= soft && active) {
-            app.log.info(`[watchdog] ${inst.containerName} mem=${mb}MiB ≥ soft=${soft}MiB 但用户在使用，延后`);
+            app.log.info(`[watchdog] ${inst.containerName} mem=${mb}MiB ≥ soft=${soft}MiB 但用户在使用，延后（viewers=${viewers}）`);
           }
         }
         // 2) 响应性自愈：探测 VNC 是否还能提供页面；连续 N 次无响应 → 重启。

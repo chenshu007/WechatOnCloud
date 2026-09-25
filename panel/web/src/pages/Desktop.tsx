@@ -179,6 +179,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   // 声音（扬声器）开关：每次打开实例都默认【关】，不持久化 on 状态（用户要求）。音频桥是额外一条到 kclient
   // 的 socket.io，蓝牙外放(AirPods)等场景交互较敏感，默认关最稳、最可预期；想听声音手动开即可（开→建立音频桥，
   // 关→断开）。开了之后在桌面上点一下即可解挂起出声（见下方 resumePlayback 的 iframe 手势监听）。
+  // Explicit per-page opt-in. Reloading or opening another desktop disables it.
+  const [autoEnter, setAutoEnter] = useState(false);
+  useEffect(() => setAutoEnter(false), [id]);
   const [soundOn, setSoundOn] = useState(false);
   const toggleSound = () => {
     const v = !soundOn;
@@ -230,7 +233,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
 
   const inst = instances.find((i) => i.id === id);
-  const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Chromium…）
+  const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Telegram…）
   const appLabel = profile.label;
   // 进入实例时，共享列表可能尚未同步（管理页新建/安装后），先按"探测中"显示加载态，
   // 等列表刷新到该实例或超时后再判定是否真的不存在，避免从管理页跳转时误报"实例不存在"。
@@ -781,10 +784,10 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     setImeSending(true);
     try {
       await api.typeInInstance(id, t);
-      // 打完直接补一个回车把消息发出去（issue #81），焦点【始终留在本输入条】。
+      // 仅本页显式勾选后才补 Return；默认只填字。焦点始终留在本输入条。
       // 切勿在转发模式把焦点切回虚拟机——那等于开了"无感输入"，用户接着打的拼音会以原始 keysym 直灌微信
       // 输入框（出现 "nniih'h你好啊" 这种串码）。下一条仍在本条用本机输入法安全地打。
-      await api.keyInInstance(id, 'Return');
+      if (autoEnter) await api.keyInInstance(id, 'Return');
       setImeText('');
     } catch (e: any) {
       toast(e?.message || '发送失败：请确认实例已「升级实例」（镜像含 xclip/xdotool）', 'error');
@@ -1227,15 +1230,22 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                     sendImeText();
                   }
                 }}
-                placeholder="中文输入这里 → 回车直接发送到应用（先点好应用的输入框）。Shift+回车换行。"
+                placeholder={autoEnter
+                  ? '回车将填入并发送到应用。Shift+回车换行。'
+                  : '回车只填入应用输入框；确认内容后请在应用内发送。Shift+回车换行。'}
                 rows={1}
               />
+              <label>
+                <input type="checkbox" checked={autoEnter} disabled={imeSending}
+                  onChange={(e) => setAutoEnter(e.target.checked)} />
+                自动回车发送
+              </label>
               <button
                 className="btn btn-primary iv-imebar-send"
                 disabled={imeSending || !imeText.trim()}
                 onClick={sendImeText}
               >
-                {imeSending ? '发送中' : '发送'}
+                {imeSending ? '处理中' : autoEnter ? '填入并发送' : '填入'}
               </button>
             </div>
           )}

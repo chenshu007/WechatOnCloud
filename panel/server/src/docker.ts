@@ -4,7 +4,7 @@ import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, 
 import http from 'node:http';
 import zlib from 'node:zlib';
 import Docker from 'dockerode';
-import { instanceAppType, getDesktopDark, type Instance } from './store.js';
+import { instanceAppType, requireSupportedApp, type Instance } from './store.js';
 
 const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
 const PUID = process.env.PUID || '1000';
@@ -173,10 +173,6 @@ function envList(inst: Instance): string[] {
   const appType = instanceAppType(inst);
   env.push(`WOC_APP_TYPE=${appType}`);
   if (appType === 'custom' && inst.customLaunch) env.push(`WOC_CUSTOM_LAUNCH=${inst.customLaunch}`);
-  // 深色模式：作为新实例启动时的初始明暗下发给 autostart（autostart 据此设 portal color-scheme，
-  // 微信等 Chromium 系应用即跟随系统深色）。开关由面板顶栏主题统一控制、持久化在 accounts.json，
-  // 运行中的实例则通过 setInstanceDark 实时切换（见下）。
-  if (getDesktopDark()) env.push('WOC_DARK=1');
   return env;
 }
 
@@ -202,17 +198,29 @@ async function ensureImage(): Promise<void> {
 }
 
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
-export async function runInstance(inst: Instance): Promise<void> {
+export async function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
+  requireSupportedApp(inst);
   const net = await ensureNetwork();
-  await ensureImage();
+  const existing = docker.getContainer(inst.containerName);
+  let info: Docker.ContainerInspectInfo | undefined;
   try {
-    const existing = docker.getContainer(inst.containerName);
-    await existing.inspect();
+    info = await existing.inspect();
+  } catch (e: any) {
+    // Permission/daemon failures are not evidence that the container is absent.
+    if (e?.statusCode !== 404) throw e;
+  }
+  if (opts?.keepImage && !info?.Image) {
+    throw new Error('无法确认原实例镜像，已取消重启；不会改用其它版本');
+  }
+  const image = opts?.keepImage ? info!.Image : WECHAT_IMAGE;
+  // Resolve the image before removing anything. Failed pulls leave the old
+  // container intact; restarts never contact a registry or follow a mutable tag.
+  if (opts?.keepImage) await docker.getImage(image).inspect();
+  else await ensureImage();
+  if (info) {
     // 删除前先把旧容器最后日志快照进持久日志，否则随容器删除就看不到"上次为何停/崩"。
     await snapshotContainerLog(inst, '容器重建（重启/升级/自愈），保留上一容器最后日志');
     await existing.remove({ force: true });
-  } catch {
-    /* 不存在，正常 */
   }
   // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
   const vids = videoDevices();
@@ -223,6 +231,7 @@ export async function runInstance(inst: Instance): Promise<void> {
     SecurityOpt: ['seccomp=unconfined'],
     ShmSize: SHM_SIZE,
     RestartPolicy: { Name: 'unless-stopped' },
+    LogConfig: { Type: 'json-file', Config: { 'max-size': '20m', 'max-file': '2' } },
   };
   if (INSTANCE_MEM > 0) {
     hostConfig.Memory = INSTANCE_MEM;
@@ -248,7 +257,7 @@ export async function runInstance(inst: Instance): Promise<void> {
   const mac = realisticMac(inst.id);
   const createOpts: Docker.ContainerCreateOptions = {
     name: inst.containerName,
-    Image: WECHAT_IMAGE,
+    Image: image,
     // 内部 hostname 伪装成"个人电脑"名（不再用 woc-wx-<hex>，那是容器/服务器特征）。
     // 反代靠容器名 name 寻址，与此 hostname 无关。
     Hostname: realisticHostname(inst.id),
@@ -282,6 +291,7 @@ export async function runInstance(inst: Instance): Promise<void> {
 
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
 export async function ensureRunning(inst: Instance): Promise<void> {
+  requireSupportedApp(inst);
   try {
     const c = docker.getContainer(inst.containerName);
     const info = await c.inspect();
@@ -292,13 +302,10 @@ export async function ensureRunning(inst: Instance): Promise<void> {
 }
 
 // 升级实例：拉取最新微信镜像后重建容器（保留数据卷 → 登录态不丢）。
-// 拉取失败（本地自构建 / 离线 / 仓库不可达）则用本地现有镜像重建，不阻断。
+// 拉取失败则保留旧容器并报错，不回退 latest，也不把旧镜像重建报告为升级成功。
 export async function upgradeInstance(inst: Instance): Promise<void> {
-  try {
-    await pullImage();
-  } catch (e: any) {
-    console.warn('[docker] 升级时拉取镜像失败，改用本地镜像重建:', e?.message || e);
-  }
+  requireSupportedApp(inst);
+  await pullImage();
   await runInstance(inst);
 }
 
@@ -306,6 +313,7 @@ export async function upgradeInstance(inst: Instance): Promise<void> {
 // 一个全新的唯一值（相当于"换一台新设备"）。用于某账号被腾讯风控标记后手动滚新设备身份。
 // 仅对含身份钩子的新镜像有效；旧镜像（升级前）无钩子，先 throw 提示升级，避免做无用功。
 export async function regenInstanceMachineId(inst: Instance): Promise<void> {
+  requireSupportedApp(inst);
   const hasHook = (
     await execCapture(inst, [
       'sh',
@@ -318,8 +326,7 @@ export async function regenInstanceMachineId(inst: Instance): Promise<void> {
   }
   // 删除持久化文件；重启时钩子检测到缺失 → 生成新的唯一 machine-id 并写回卷
   await execCapture(inst, ['sh', '-c', 'rm -f /config/.woc-machine-id']);
-  await stopInstance(inst);
-  await runInstance(inst);
+  await runInstance(inst, { keepImage: true });
 }
 
 // 停止实例容器（保留容器与数据卷，可再启动）。
@@ -520,7 +527,7 @@ async function execCapture(inst: Instance, cmd: string[], user = 'abc'): Promise
 // 回退老的 wechat-ctl.sh（旧实例都是微信）。appType 取值受 instanceAppType 约束，可安全内插进 shell。
 export async function triggerWechat(inst: Instance, cmd: 'install' | 'update'): Promise<void> {
   const c = docker.getContainer(inst.containerName);
-  const at = instanceAppType(inst);
+  const at = requireSupportedApp(inst);
   const action = cmd === 'update' ? 'update' : 'install';
   const exec = await execCreate(c, {
     Cmd: ['bash', '-c', `if [ -x /woc/app-ctl.sh ]; then /woc/app-ctl.sh ${at} ${action}; else /woc/wechat-ctl.sh ${action}; fi`],
@@ -543,9 +550,12 @@ export interface WechatStatus {
 const DEFAULT_STATUS: WechatStatus = { phase: 'idle', percent: 0, installed: false, version: '', message: '未安装', updatedAt: 0 };
 
 export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
+  if (instanceAppType(inst) === 'chromium') {
+    return { ...DEFAULT_STATUS, phase: 'error', message: '浏览器实例功能已移除，原数据卷仍保留' };
+  }
   try {
     // 兼容旧容器（无 /woc/app-ctl.sh）：有则按 appType 取状态，无则回退老的 wechat-ctl.sh（旧实例皆微信）。
-    const at = instanceAppType(inst);
+    const at = requireSupportedApp(inst);
     const raw = await execCapture(inst, [
       'bash',
       '-c',
@@ -742,6 +752,14 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
       c += `===== 本次容器日志（实时 tail 300） =====\n${(await instanceLogs(inst, 300)).trimEnd() || '（无）'}\n`;
     } catch (e: any) {
       c += `===== 本次容器日志 =====\n获取失败：${e?.message || e}\n`;
+    }
+    try {
+      const status = await execCapture(inst, ['sh', '-c', 'head -c 8192 /config/.woc-state/status.json 2>/dev/null || true']);
+      const installLog = await execCapture(inst, ['sh', '-c', 'tail -n 50 /config/.woc-state/install.log 2>/dev/null | tail -c 16384 || true']);
+      c += `\n===== 安装状态 =====\n${status.trim() || '（无）'}\n`;
+      c += `\n===== 安装日志（最后 50 行，最多 16KiB） =====\n${installLog.trim() || '（无）'}\n`;
+    } catch {
+      c += '\n===== 安装诊断 =====\n不可用（容器可能已停止）\n';
     }
     entries.push({ name: `instances/${inst.id}.log`, content: c });
   }
@@ -1183,7 +1201,8 @@ async function applyXsettingsFont(inst: Instance, family: string): Promise<void>
     'Xft/Hinting 1',
     'Xft/HintStyle "hintslight"',
     'Xft/RGBA "rgb"',
-    'Xft/DPI 96',
+    // XSETTINGS uses DPI * 1024: 96 DPI = 98304.
+    'Xft/DPI 98304',
     `Gtk/FontName "${family} 10"`,
   ];
   await execCapture(inst, ['sh', '-c', `printf '%s\\n' ${lines.map(l => `'${l}'`).join(' ')} > ${conf}`]);

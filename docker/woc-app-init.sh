@@ -7,8 +7,8 @@ APP_TYPE="${WOC_APP_TYPE:-}"
 
 # 仅允许已知的简单标识，杜绝写入异常内容
 case "$APP_TYPE" in
-  wechat | telegram | chromium | custom) ;;
-  *) exit 0 ;;
+  wechat | telegram | custom) ;;
+  *) echo "[woc-app] 不支持的应用类型: $APP_TYPE" >&2; exit 1 ;;
 esac
 
 TMP=/config/.woc-app.tmp

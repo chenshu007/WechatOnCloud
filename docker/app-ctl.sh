@@ -13,7 +13,7 @@ if [ "$APP" = "wechat" ]; then exec /woc/wechat-ctl.sh "$ACTION"; fi
 
 # shellcheck source=/dev/null
 . /woc/app-defs.sh
-woc_app_def "$APP"
+woc_app_def "$APP" || exit 1
 
 STATE_DIR="${WOC_STATE_DIR:-/config/.woc-state}"
 STATUS_FILE="$STATE_DIR/status.json"
@@ -75,7 +75,6 @@ case "$ACTION" in
   install | update)
     case "$APP" in
       telegram) install_telegram ;;
-      chromium) write_status done 100 "Chromium 随镜像就绪" ;; # 后续：apt 烤进镜像后即就绪
       custom)
         if is_installed; then write_status done 100 "就绪"; else write_status error 0 "请先在「数据卷」上传并配置自定义应用"; fi ;;
       *) echo "未知应用: $APP" >&2; exit 1 ;;

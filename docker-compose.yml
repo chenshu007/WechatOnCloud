@@ -1,9 +1,9 @@
 # WechatOnCloud —— 面板为唯一服务；微信实例由面板按需动态创建（docker run）。
 # 面板挂载 docker.sock 来创建/启动/删除微信实例容器，并反向代理到它们的 KasmVNC。
-# 镜像默认从 Docker Hub 拉取（GHCR 备用），无需本地构建。要改配置：复制 .env.example 为 .env 后修改。
+# no-Chromium: 显式指定已核验的双镜像，部署时必须保留 secure overlay。见 maintenance/README.md。
 services:
   panel:
-    # 镜像源前缀默认 Docker Hub（飞牛等 NAS 有加速）；拉不动时改 .env 的 WOC_IMAGE_PREFIX 切到 GHCR/国内反代（见 .env.example）。
+    # 禁止默认 latest；引用来自同一源码版本的双镜像 receipt。
     image: ${WOC_PANEL_IMAGE:?Set the verified no-Chromium panel image reference}
     container_name: woc-panel
     # pull_policy 用默认（missing）：本地已有同名镜像就直接用，没有才去镜像源拉。
@@ -12,7 +12,7 @@ services:
 
     environment:
       - PORT=8080
-      # 新建微信实例时使用的镜像（多架构，amd64/arm64 自动匹配）；前缀同样跟随 WOC_IMAGE_PREFIX。
+      # 保留显式 tag/digest，后端校验 no-Chromium 身份及源码版本。
       - WOC_WECHAT_IMAGE=${WOC_WECHAT_IMAGE:?Set the verified no-Chromium instance image reference}
       # 透传给每个微信实例容器（KasmVNC 基础镜像用它们降权运行）
       - PUID=${WOC_PUID:-1000}
@@ -38,7 +38,6 @@ services:
       - WOC_SESSION_DAYS=${WOC_SESSION_DAYS:-30}
       # 拉取实例镜像的"无进度"超时（分钟，默认 5）。NAS 直连 docker.io 卡死时据此快速失败而非无限转圈。
       - WOC_PULL_STALL_MIN=${WOC_PULL_STALL_MIN:-5}
-      # 实例桌面深色：由面板顶栏的主题开关统一控制（管理员），持久化在 accounts.json，无需在此配 env。
       # 面板首个管理员账号（仅首次启动、无账号文件时写入；务必改掉默认密码）
       - PANEL_ADMIN_USER=${WOC_USER:-admin}
       - PANEL_ADMIN_PASSWORD=${WOC_PASSWORD:-wechat}

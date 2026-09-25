@@ -25,3 +25,10 @@ ENV WOC_VERSION=${WOC_VERSION} \
     PORT=8080
 EXPOSE 8080
 CMD ["npm", "run", "start"]
+
+ARG WOC_SOURCE_REVISION
+LABEL io.wechatoncloud.variant="no-chromium" \
+      org.opencontainers.image.source="https://github.com/chenshu007/WechatOnCloud" \
+      org.opencontainers.image.revision="${WOC_SOURCE_REVISION}" \
+      org.opencontainers.image.version="${WOC_VERSION}"
+ENV WOC_SOURCE_REVISION=${WOC_SOURCE_REVISION}

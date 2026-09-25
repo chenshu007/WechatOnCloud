@@ -103,3 +103,12 @@ test('retired missing-container export uses a validated read-only helper and rem
     assert.equal(retired.appType, 'chromium');
   } finally { Docker.prototype.getContainer = oldGet; Docker.prototype.createContainer = oldCreate; }
 });
+test('both Dockerfiles bake matching source identity; Compose requires both explicit references and secure overlay', () => {
+  for (const path of ['panel/Dockerfile', 'docker/Dockerfile']) {
+    const s = readFileSync(path, 'utf8');
+    for (const text of ['ARG WOC_VERSION', 'ARG WOC_SOURCE_REVISION', 'io.wechatoncloud.variant="no-chromium"', 'org.opencontainers.image.revision="${WOC_SOURCE_REVISION}"', 'org.opencontainers.image.version="${WOC_VERSION}"']) assert.ok(s.includes(text), `${path}: ${text}`);
+  }
+  const compose = readFileSync('docker-compose.yml', 'utf8'); assert.match(compose, /WOC_PANEL_IMAGE:\?/); assert.match(compose, /WOC_WECHAT_IMAGE:\?/);
+  const overlay = readFileSync('maintenance/examples/compose.no-chromium.yml', 'utf8');
+  assert.match(overlay, /\/dev\/null:\/var\/run\/docker.sock/); assert.match(overlay, /DOCKER_HOST: tcp:\/\/docker-socket-proxy:2375/);
+});

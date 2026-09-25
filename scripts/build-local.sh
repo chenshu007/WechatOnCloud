@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${WOC_TEST_DOCKER_ALLOWED:?Only use an authorized disposable build/test Docker environment}"
+[[ "$WOC_TEST_DOCKER_ALLOWED" == 1 ]]
 : "${WOC_VERSION:?Example: 1.5.0-no-chromium.1}"
 [[ "$WOC_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-no-chromium\.[0-9]+$ ]]
 [[ -z "$(git status --porcelain)" ]] || { echo 'Commit source before building'; exit 1; }

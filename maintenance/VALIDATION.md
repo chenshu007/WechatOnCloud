@@ -4,14 +4,15 @@
 
 | 检查 | 实际命令 | 结果 / 证据 |
 | --- | --- | --- |
-| 完整无需 Docker 门禁 | `bash scripts/check-no-chromium.sh` | 通过依赖安装、两端 tsc、TS/Python 测试、Vite/PWA、shell 语法、diff 检查；后续补充导出 helper 用例及最终改动又按下列定向命令复查 |
-| TypeScript 行为 | `node --import ./panel/server/node_modules/tsx/dist/loader.mjs --test tests/*.test.ts` | 12 passed / 0 failed；含真实 Fastify HTTP + Docker mock 的权限、retired 读取/导出/显式删除、空 POST；无 Docker daemon |
+| 完整无需 Docker 门禁 | `bash scripts/check-no-chromium.sh` | 通过依赖安装、两端 tsc、TS/Python 测试、Vite/PWA、shell 语法、diff 检查；最终源代码再次执行完整门禁通过 |
+| TypeScript 行为 | `node --import ./panel/server/node_modules/tsx/dist/loader.mjs --test tests/*.test.ts` | 13 passed / 0 failed；含真实 Fastify HTTP + Docker mock 的权限、retired 读取/导出/显式删除、空 POST；无 Docker daemon |
 | 同步/发布核验脚本 | `python3 -m unittest discover -s tests -p '*_test.py'` | 12 passed：同步 7 项（无更新、dry-run、新版/重复、冲突、检查失败、脏树、tag 移动），发布 pair 5 项（两个 digest、第二镜像缺失、身份、架构、latest 拒绝） |
 | 后端类型 | `panel/server/node_modules/.bin/tsc --noEmit -p panel/server` | 通过；后端上游以 tsx 执行，没有单独 npm build，未伪称存在额外构建步骤 |
 | 前端类型 | `panel/web/node_modules/.bin/tsc --noEmit -p panel/web` | 通过 |
 | 前端构建 | `npm run build --prefix panel/web`；门禁后改用 `(cd panel/web && ./node_modules/.bin/vite build)` | 均通过；54 modules，PWA precache 9，生成 manifest.webmanifest、sw.js、workbox。直接 Vite 使用已跟踪图标，避免宿主 zlib 重生成 PNG 导致同步候选脏树；初次生成的图标已恢复到原始基线字节 |
 | 工作流 | `/tmp/woc-actionlint/actionlint .github/workflows/release.yml .github/workflows/no-chromium-sync.yml` | actionlint 1.7.12 通过；YAML 另行解析通过。未运行远端 Actions |
 | 启动脚本语法 | `bash -n docker/autostart docker/app-defs.sh docker/app-ctl.sh docker/woc-app-init.sh scripts/*.sh` | 通过 |
+| 实际上游检查 | `python3 scripts/sync-upstream.py` | 返回 `tag=v1.5.0`、`status=no-update`，未创建同步分支 |
 | Patch | `git diff --check` | 通过 |
 | 安全 overlay | `cmp docker-compose.secure.yml /Volumes/Docker/WechatOnCloud/docker-compose.secure.yml` | 完全一致；只比较配置文件，不证明运行时已应用 |
 

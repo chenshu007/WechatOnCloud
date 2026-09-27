@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Cropper from 'react-easy-crop';
-import { api, APP_LABELS, appProfile, type PanelUser, type InstanceWithStatus, type VolEntry, type AppType, type VersionInfo } from '../api';
+import { api, APP_LABELS, appProfile, fmtUploadSize, type PanelUser, type InstanceWithStatus, type VolEntry, type AppType, type VersionInfo } from '../api';
 import { InstanceIcon, ICON_CHOICES } from '../AppIcon';
 import { useUI, PasswordInput } from '../ui';
 import { useAuth } from '../auth';
@@ -1297,8 +1297,8 @@ function InstanceIconEditor({ inst, onClose, onDone }: { inst: InstanceWithStatu
 }
 
 // 数据卷管理（仅管理员）：整卷备份/恢复 + 文件浏览器（浏览/上传/解压/下载/改名/移动/删除）。
-// 主要场景：把 PC 微信数据迁移上来、跨实例迁移、离线备份。全程在「运行中」的实例上操作
-// （浏览/改名/删除靠 docker exec，需容器运行）。整卷恢复会覆盖全部数据，强提示并建议恢复后重启实例。
+// 主要场景：把 PC 微信数据迁移上来、跨实例迁移、离线备份。文件浏览在「运行中」的实例上操作
+// （浏览/改名/删除靠 docker exec，需容器运行）。整卷恢复会覆盖数据，强提示；服务端校验通过后自动停止→写入→启动实例。
 function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus; onClose: () => void; onChanged: () => void }) {
   const { toast, confirm } = useUI();
   const [path, setPath] = useState('');
@@ -1387,24 +1387,41 @@ function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus;
     await run('删除中…', () => api.volumeDelete(inst.id, join(path, en.name)), '已删除');
   };
 
+  // 上传进度 → 进行中文案；传完后服务端还要处理（改名 / 校验 / 写入），文案随阶段更新
+  const progress = (name: string) => (loaded: number, total: number) =>
+    setBusy(
+      loaded < total
+        ? `上传 ${name}：${Math.floor((loaded / total) * 100)}%（${fmtUploadSize(loaded)} / ${fmtUploadSize(total)}）`
+        : `已上传 ${name}，正在处理…`,
+    );
+  const stage = (s: string) => setBusy(`${s}…`);
+
   const onPick = (kind: 'upload' | 'extract' | 'restore') => async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
     if (kind === 'restore') {
+      const running = inst.runtime === 'running';
       const ok = await confirm({
         title: '恢复整卷备份？',
-        body: `将用「${file.name}」覆盖该实例 /config 的全部数据（含登录态、聊天库），不可撤销。建议仅用于本系统导出的备份；恢复后请在卡片上「重启」实例以加载数据。`,
+        body: `将用「${file.name}」覆盖该实例 /config 中的数据（含登录态、聊天库），不可撤销。只接受本系统导出的整卷备份。${
+          running ? '实例正在运行，写入前会自动停止、写完自动启动。' : ''
+        }`,
         danger: true,
         confirmText: '覆盖恢复',
       });
       if (!ok) return;
-      await run(`恢复 ${file.name}…`, () => api.volumeRestore(inst.id, file), '恢复完成，请重启实例以加载数据', true);
+      await run(
+        `上传 ${file.name}…`,
+        () => api.volumeRestore(inst.id, file, progress(file.name), stage),
+        running ? '恢复完成，实例已重新启动' : '恢复完成（实例保持停止，启动后生效）',
+        true,
+      );
       onChanged();
       return;
     }
-    if (kind === 'upload') await run(`上传 ${file.name}…`, () => api.volumeUpload(inst.id, path, file), '上传完成');
-    else await run(`解压 ${file.name}…`, () => api.volumeExtract(inst.id, path, file), '解压完成');
+    if (kind === 'upload') await run(`上传 ${file.name}…`, () => api.volumeUpload(inst.id, path, file, progress(file.name)), '上传完成');
+    else await run(`上传 ${file.name}…`, () => api.volumeExtract(inst.id, path, file, progress(file.name), stage), '解压完成');
   };
 
   const disabled = !!busy;
@@ -1425,6 +1442,8 @@ function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus;
           </div>
           <div className="vol-hint">整卷含聊天记录，用于跨实例迁移 / 离线备份。</div>
         </div>
+
+        {busy && <div className="vol-busy">{busy}</div>}
 
         {offline ? (
           <div className="vol-warn">
@@ -1468,8 +1487,6 @@ function VolumeManager({ inst, onClose, onChanged }: { inst: InstanceWithStatus;
                 <button className="btn btn-primary" disabled={disabled || !mkdirName.trim()} onClick={doMkdir}>创建</button>
               </div>
             )}
-
-            {busy && <div className="vol-busy">{busy}</div>}
 
             {/* 文件列表 */}
             <div className="vol-list">

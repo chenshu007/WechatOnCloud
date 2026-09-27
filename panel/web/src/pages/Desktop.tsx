@@ -209,6 +209,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const [imeText, setImeText] = useState('');
   const [imeSending, setImeSending] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadPct, setUploadPct] = useState(''); // 进行中的上传进度文案（「37%」「(2/5) 80%」）
+  const uploadQueue = useRef<File[]>([]);
+  const uploadBusy = useRef(false);
   const [starting, setStarting] = useState(false);
   const [control, setControl] = useState<{ free: boolean; mine: boolean; holder: string | null } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -664,20 +667,35 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
+  // 逐个上传；上传途中再拖进 / 粘贴 / 选择的文件排进队列，由正在跑的这一轮接着传（此前会另起一轮并发上传）
   const uploadFiles = async (list: FileList | File[]) => {
-    const arr = Array.from(list);
-    if (!arr.length) return;
+    uploadQueue.current.push(...Array.from(list));
+    if (uploadBusy.current || !uploadQueue.current.length) return;
+    uploadBusy.current = true;
     setUploading(true);
     let ok = 0;
-    for (const f of arr) {
-      try {
-        await api.uploadFile(id, f);
-        ok++;
-      } catch (e: any) {
-        toast(`${f.name}: ${e.message || '上传失败'}`, 'error');
+    let done = 0;
+    try {
+      while (uploadQueue.current.length) {
+        const f = uploadQueue.current.shift()!;
+        const total = done + 1 + uploadQueue.current.length;
+        const prefix = total > 1 ? `(${done + 1}/${total}) ` : '';
+        setUploadPct(`${prefix}0%`);
+        try {
+          await api.uploadFile(id, f, (loaded, size) =>
+            setUploadPct(loaded < size ? `${prefix}${Math.floor((loaded / size) * 100)}%` : `${prefix}写入中`),
+          );
+          ok++;
+        } catch (e: any) {
+          toast(`${f.name}: ${e.message || '上传失败'}`, 'error');
+        }
+        done++;
       }
+    } finally {
+      uploadBusy.current = false;
+      setUploading(false);
+      setUploadPct('');
     }
-    setUploading(false);
     if (ok) {
       toast(`已上传 ${ok} 个文件到桌面，应用里可直接取用`, 'ok');
       refreshFiles();
@@ -956,7 +974,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 if (!showFiles) refreshFiles();
               }}
             >
-              文件
+              {uploading ? `文件 ${uploadPct}` : '文件'}
             </button>
             <button
               className={'ws-action' + (inputMode === 'seamless' ? ' on' : '')}
@@ -1179,7 +1197,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 }}
               />
               <button className="btn btn-primary files-upload" disabled={uploading} onClick={() => fileInput.current?.click()}>
-                {uploading ? '上传中…' : '＋ 选择文件上传'}
+                {uploading ? `上传中 ${uploadPct}` : '＋ 选择文件上传'}
               </button>
               <div className="files-hint">也可直接把文件拖进来。下方为桌面（~/Desktop）里的文件，应用收到的文件另存到桌面即可在此下载。</div>
               <div className="files-list">

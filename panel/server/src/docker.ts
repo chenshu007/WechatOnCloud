@@ -1,5 +1,5 @@
 import { IMAGE_PASTE_SCRIPT, PasteError, validatePasteImage, withInstanceInput } from './image-paste.js';
-import { tarEntry, parseTransferFiles } from './transfer-format.js';
+import { parseTransferFiles } from './transfer-format.js';
 import { StringDecoder } from 'node:string_decoder';
 import { hostname } from 'node:os';
 import { existsSync, readdirSync, statSync } from 'node:fs';
@@ -7,7 +7,9 @@ import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, 
 import http from 'node:http';
 import { PassThrough } from 'node:stream';
 import zlib from 'node:zlib';
+import { randomBytes } from 'node:crypto';
 import Docker from 'dockerode';
+import { tarArchive, tarEntry, tarFileStream, tarSingleFile, openTarStream, scanArchive, sniffArchive } from './tar.js';
 import { instanceAppType, requireSupportedApp, type Instance } from './store.js';
 
 const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
@@ -205,17 +207,18 @@ async function ensureImage(): Promise<void> {
 // 同一实例的重建串行执行（移植自上游 c968908）：手动重启、看门狗自愈、卡死自愈、升级可能撞在一起，
 // 并发时两边都「删旧建新」，实测同时点两次重启必有一次报「容器名已被占用」失败。
 const lifecycleChains = new Map<string, Promise<unknown>>();
-export function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
-  const run = (lifecycleChains.get(inst.id) || Promise.resolve()).then(
-    () => runInstanceNow(inst, opts),
-    () => runInstanceNow(inst, opts),
-  );
+// 重建、整卷恢复（停→写→启）共用这把锁。
+function withLifecycle<T>(instId: string, fn: () => Promise<T>): Promise<T> {
+  const run = (lifecycleChains.get(instId) || Promise.resolve()).then(fn, fn);
   const tail = run.catch(() => undefined);
-  lifecycleChains.set(inst.id, tail);
+  lifecycleChains.set(instId, tail);
   void tail.then(() => {
-    if (lifecycleChains.get(inst.id) === tail) lifecycleChains.delete(inst.id);
+    if (lifecycleChains.get(instId) === tail) lifecycleChains.delete(instId);
   });
   return run;
+}
+export function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
+  return withLifecycle(inst.id, () => runInstanceNow(inst, opts));
 }
 async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
   requireSupportedApp(inst);
@@ -663,17 +666,10 @@ export async function pullImage(onProgress?: (line: any) => void): Promise<void>
 // 反向：把微信收到的文件另存到桌面，即可在面板里下载。
 const TRANSFER_DIR = '/config/Desktop';
 
-// 极简单文件 tar 编码（putArchive 需要 tar；避免引入第三方依赖）。
-function tarSingleFile(name: string, content: Buffer): Buffer {
-  return Buffer.concat([tarEntry(name, content), Buffer.alloc(1024)]);
-}
-
 // ---------- 诊断包 ----------
-// 多文件 tar.gz（内存构建；诊断包通常仅数 MB）。文件名用 ASCII 路径避免 utf8 超 100 字节。
+// 多文件 tar.gz（内存构建；诊断包通常仅数 MB）。
 function buildTarGz(entries: { name: string; content: string | Buffer }[]): Buffer {
-  const parts = entries.map((e) => tarEntry(e.name, Buffer.isBuffer(e.content) ? e.content : Buffer.from(e.content, 'utf8')));
-  parts.push(Buffer.alloc(1024, 0)); // 两个空块标记归档结束
-  return zlib.gzipSync(Buffer.concat(parts));
+  return zlib.gzipSync(tarArchive(entries.map((e) => tarEntry(e.name, Buffer.isBuffer(e.content) ? e.content : Buffer.from(e.content, 'utf8')))));
 }
 
 // 汇总诊断包：系统信息 + 面板全局日志 + 每个实例（容器状态 + 持久日志 + 实时日志）+ 全部 woc-* 容器清单。
@@ -798,9 +794,13 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
   return buildTarGz(entries);
 }
 
-// 校验文件名为安全 basename（防路径穿越）。
+// 校验文件名为安全 basename（防路径穿越）。长度按字节算：Linux 文件名上限 255 字节，一个汉字占 3 字节。
 function safeName(name: string): boolean {
-  return !!name && name.length <= 200 && !name.includes('/') && !name.includes('\0') && name !== '.' && name !== '..';
+  return !!name && Buffer.byteLength(name, 'utf8') <= 255 && !name.includes('/') && !name.includes('\0') && name !== '.' && name !== '..';
+}
+function assertSafeName(name: string): void {
+  if (Buffer.byteLength(name || '', 'utf8') > 255) throw new Error('文件名太长（最多 255 字节，约 85 个汉字），请改短后再上传');
+  if (!safeName(name)) throw new Error('文件名不合法');
 }
 
 // 壁纸/字体文件名：在 safeName 基础上，额外拒绝 shell 元字符。这些名字会被拼进 `sh -c '...${name}...'`
@@ -810,11 +810,70 @@ function safeMediaName(name: string): boolean {
   return safeName(name) && !/['"$`\\;&|<>\r\n]/.test(name);
 }
 
-export async function uploadToInstance(inst: Instance, name: string, content: Buffer): Promise<void> {
-  if (!safeName(name)) throw new Error('文件名不合法');
-  await execCapture(inst, ['sh', '-c', `mkdir -p ${TRANSFER_DIR}`]); // abc 家目录可写
-  const c = docker.getContainer(inst.containerName);
-  await c.putArchive(tarSingleFile(name, content), { path: TRANSFER_DIR });
+// ---------- 流式写入单个文件 ----------
+// 边收边打成 tar 交给 docker，面板内存不随文件大小增长。先写到 /config/.woc-upload 下的临时名，完整收到后才改名到
+// 目标位置：上传中途断开（关页面、断网、取消）时 docker 已经写下了半截文件，此前这个半截文件就顶着正式文件名留在
+// 桌面上，看着和正常文件一样，发出去才发现打不开。临时目录与目标同在 /config 卷上，改名是原子操作。
+const UPLOAD_TMP_DIR = '/config/.woc-upload';
+
+// putArchive 的响应体是空的，读掉以释放连接
+async function putArchiveStream(inst: Instance, tar: NodeJS.ReadableStream, path: string): Promise<void> {
+  const res: any = await docker.getContainer(inst.containerName).putArchive(tar, { path });
+  if (res && typeof res.resume === 'function') res.resume();
+}
+
+// 目标所在磁盘的可用空间（字节）；查不到返回 null（不拦）
+async function freeBytesIn(inst: Instance, dir: string): Promise<number | null> {
+  try {
+    const out = await execCapture(inst, ['df', '-Pk', dir]);
+    const kb = Number(out.trim().split('\n').pop()?.trim().split(/\s+/)[3]);
+    return Number.isFinite(kb) ? kb * 1024 : null;
+  } catch {
+    return null;
+  }
+}
+
+const fmtBytes = (n: number) => (n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(1)} GB` : `${Math.max(1, Math.round(n / 1024 ** 2))} MB`);
+
+async function assertFreeSpace(inst: Instance, dir: string, need: number): Promise<void> {
+  const free = await freeBytesIn(inst, dir);
+  if (free !== null && need + 64 * 1024 ** 2 > free) {
+    throw Object.assign(new Error(`实例数据盘空间不足：需要 ${fmtBytes(need)}，只剩 ${fmtBytes(free)}`), { statusCode: 507 });
+  }
+}
+
+// docker / 命令行的英文报错翻成能看懂的
+function friendlyWriteError(e: any): Error {
+  const msg = String(e?.message || e);
+  if (/no space left on device/i.test(msg)) return Object.assign(new Error('实例数据盘空间不足，文件没能写完'), { statusCode: 507 });
+  if (/is not running|container .* is restarting/i.test(msg)) return new Error('实例未运行，请先启动实例');
+  if (/cannot overwrite directory|Is a directory/i.test(msg)) return new Error('目标位置已有同名文件夹');
+  if (/File name too long/i.test(msg)) return new Error('文件名太长');
+  return e instanceof Error ? e : new Error(msg);
+}
+
+async function putFileStream(inst: Instance, dir: string, name: string, size: number, body: AsyncIterable<Buffer>): Promise<void> {
+  assertSafeName(name);
+  await execCapture(inst, ['mkdir', '-p', dir, UPLOAD_TMP_DIR]).catch((e) => {
+    throw friendlyWriteError(e);
+  });
+  // 顺手清掉面板被重启等情况下没来得及删的临时文件；正在写的临时文件 mtime 一直在刷新，不会误删
+  await execCapture(inst, ['find', UPLOAD_TMP_DIR, '-maxdepth', '1', '-type', 'f', '-mmin', '+180', '-delete'], 'root').catch(() => {});
+  await assertFreeSpace(inst, UPLOAD_TMP_DIR, size);
+  const tmp = `${UPLOAD_TMP_DIR}/part-${Date.now()}-${randomBytes(4).toString('hex')}`;
+  const tar = tarFileStream(tmp.slice(UPLOAD_TMP_DIR.length + 1), size, body);
+  try {
+    await putArchiveStream(inst, tar, UPLOAD_TMP_DIR);
+    await execCapture(inst, ['mv', '-fT', '--', tmp, `${dir}/${name}`], 'root');
+  } catch (e) {
+    tar.destroy();
+    await execCapture(inst, ['rm', '-f', '--', tmp], 'root').catch(() => {});
+    throw friendlyWriteError(e);
+  }
+}
+
+export async function uploadToInstance(inst: Instance, name: string, size: number, body: AsyncIterable<Buffer>): Promise<void> {
+  await putFileStream(inst, TRANSFER_DIR, name, size, body);
 }
 
 export interface TransferFile {
@@ -1021,7 +1080,7 @@ export async function keyInInstance(inst: Instance, key: string): Promise<void> 
 const VOL_ROOT = '/config';
 
 // 把用户给的相对路径安全解析为 /config 下的绝对路径；禁止 .. 与 NUL；剥离前导 /。
-function safeVolPath(rel: string): string {
+export function safeVolPath(rel: string): string {
   const raw = (rel ?? '').replace(/\\/g, '/');
   if (raw.includes('\0')) throw new Error('路径不合法');
   const parts: string[] = [];
@@ -1033,9 +1092,6 @@ function safeVolPath(rel: string): string {
   return parts.length ? `${VOL_ROOT}/${parts.join('/')}` : VOL_ROOT;
 }
 const relOf = (abs: string): string => (abs === VOL_ROOT ? '' : abs.slice(VOL_ROOT.length + 1));
-// gzip 魔数自动识别（用户上传可能是 .tar 或 .tar.gz；本系统备份恒为 .gz）。
-const maybeGunzip = (buf: Buffer): Buffer =>
-  buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b ? zlib.gunzipSync(buf) : buf;
 
 export interface VolEntry {
   name: string;
@@ -1089,20 +1145,54 @@ export async function volDelete(inst: Instance, rel: string): Promise<void> {
   await execCapture(inst, ['rm', '-rf', abs]);
 }
 
-// 上传单个文件到指定目录（tarSingleFile 写入 uid/gid 1000，落地即 abc 属主，微信可读）。
-export async function volUploadFile(inst: Instance, rel: string, name: string, content: Buffer): Promise<void> {
-  if (!safeName(name)) throw new Error('文件名不合法');
-  const dir = safeVolPath(rel);
-  await execCapture(inst, ['mkdir', '-p', dir]);
-  await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, content), { path: dir });
+// 上传单个文件到指定目录（tar 头写 uid/gid 1000，落地即 abc 属主，微信可读）。流式写入，见 putFileStream。
+export async function volUploadFile(inst: Instance, rel: string, name: string, size: number, body: AsyncIterable<Buffer>): Promise<void> {
+  await putFileStream(inst, safeVolPath(rel), name, size, body);
+}
+
+// 上传的压缩包（已暂存在面板数据目录）写进实例前的整体校验：格式对、没被截断、gzip 没坏、路径不越出目标目录、
+// 没有设备文件；整卷恢复还要求所有条目都在 config/ 下（本系统备份的格式）。此前不校验直接解到容器根目录，
+// 传错了包（比如把 PC 微信文件夹的压缩包当备份传上去）就散落进容器的系统目录。
+// 返回解压后普通文件的总字节数，用来预先检查目标盘空间。
+export async function volCheckArchive(path: string, mode: 'extract' | 'restore'): Promise<{ gzip: boolean; bytes: number }> {
+  const kind = await sniffArchive(path);
+  if (kind === 'zip') throw new Error('暂不支持 zip，请打包成 .tar 或 .tar.gz 后再上传');
+  if (kind === 'other') throw new Error('不是 .tar / .tar.gz 压缩包（或文件已损坏）');
+  const gzip = kind === 'gzip';
+  let entries = 0;
+  let bytes = 0;
+  await scanArchive(path, gzip, (e) => {
+    entries++;
+    const segs = e.name.split('/').filter((x) => x && x !== '.');
+    if (segs.includes('..') || (e.type === '1' && e.linkname.split('/').includes('..'))) {
+      throw new Error(`压缩包里有越出目标目录的路径（${e.name}），已拒绝`);
+    }
+    if (e.type === '3' || e.type === '4' || e.type === '6') throw new Error(`压缩包里有设备文件或管道（${e.name}），已拒绝`);
+    if (mode === 'restore' && segs[0] !== 'config') {
+      throw new Error(`这不是本系统导出的整卷备份：「${e.name}」不在 config/ 目录下。要导入别处的数据请用「上传并解压」`);
+    }
+    bytes += e.size;
+  });
+  if (!entries) throw new Error('压缩包是空的');
+  return { gzip, bytes };
 }
 
 // 上传压缩包并解压到指定目录（PC 微信数据迁移：用户把文件夹打成 .tar/.tar.gz 上传）。
-// putArchive 把 tar 内容解到 dir 下，Docker 解包限制在 dir 内、防 .. 穿越。
-export async function volExtractArchive(inst: Instance, rel: string, archive: Buffer): Promise<void> {
+// putArchive 把 tar 内容解到 dir 下，Docker 解包限制在 dir 内、防 .. 穿越。gzip 在面板里流式解开。
+export async function volExtractArchive(inst: Instance, rel: string, archivePath: string, info: { gzip: boolean; bytes: number }): Promise<void> {
   const dir = safeVolPath(rel);
-  await execCapture(inst, ['mkdir', '-p', dir]);
-  await docker.getContainer(inst.containerName).putArchive(maybeGunzip(archive), { path: dir });
+  await execCapture(inst, ['mkdir', '-p', dir]).catch((e) => {
+    throw friendlyWriteError(e);
+  });
+  await assertFreeSpace(inst, dir, info.bytes);
+  const tar = openTarStream(archivePath, info.gzip);
+  try {
+    await putArchiveStream(inst, tar, dir);
+  } catch (e) {
+    throw friendlyWriteError(e);
+  } finally {
+    tar.destroy();
+  }
 }
 
 export async function volDownloadFile(inst: Instance, rel: string): Promise<{ size: number; stream: NodeJS.ReadableStream }> {
@@ -1120,9 +1210,48 @@ export async function volBackupStream(inst: Instance): Promise<NodeJS.ReadableSt
   return tar.pipe(gzip);
 }
 
-// 整卷恢复：仅适用于本系统导出的备份（条目前缀 config/），解到容器根 → 落回 /config。要求实例已停止。
-export async function volRestoreArchive(inst: Instance, archive: Buffer): Promise<void> {
-  await docker.getContainer(inst.containerName).putArchive(maybeGunzip(archive), { path: '/' });
+// 整卷恢复：仅适用于本系统导出的备份（条目前缀 config/），解到容器根 → 落回 /config。
+// 写之前先停掉实例、写完再启动（原本在运行的话）：此前在微信运行时直接覆盖它正开着的数据库文件，
+// 容易把聊天库写坏，而且界面上只是提示「恢复后请重启」。停止期间 docker 照样能往卷里写（docker cp 同理）。
+// 与重启 / 升级 / 自愈共用同一把生命周期锁，恢复中途不会被别的操作把容器拉起来。
+export async function volRestoreArchive(
+  inst: Instance,
+  archivePath: string,
+  info: { gzip: boolean; bytes: number },
+  onStage: (stage: string) => void,
+): Promise<void> {
+  await withLifecycle(inst.id, async () => {
+    const c = docker.getContainer(inst.containerName);
+    const state: any = await c.inspect().catch(() => null);
+    if (!state) throw new Error('实例容器不存在：请先在卡片上启动一次实例，再恢复');
+    const wasRunning = !!state.State?.Running;
+    if (wasRunning) {
+      onStage('停止实例');
+      try {
+        await c.stop({ t: 10 } as any);
+      } catch (e: any) {
+        if (e?.statusCode !== 304) throw e; // 304 = 已经停了
+      }
+      appendInstanceLog(inst.id, '整卷恢复：已停止实例，开始写入备份');
+    }
+    const tar = openTarStream(archivePath, info.gzip);
+    try {
+      onStage('写入数据');
+      await putArchiveStream(inst, tar, '/');
+      appendInstanceLog(inst.id, '整卷恢复：备份已写入');
+    } catch (e) {
+      appendInstanceLog(inst.id, `整卷恢复失败：${(e as any)?.message || e}`);
+      throw friendlyWriteError(e);
+    } finally {
+      tar.destroy();
+      if (wasRunning) {
+        onStage('启动实例');
+        await c.start().catch((e: any) => {
+          if (e?.statusCode !== 304) appendInstanceLog(inst.id, `整卷恢复后启动实例失败：${e?.message || e}`);
+        });
+      }
+    }
+  });
 }
 
 // ---------- 桌面壁纸 ----------

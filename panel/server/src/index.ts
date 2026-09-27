@@ -6,6 +6,7 @@ import fstatic from '@fastify/static';
 import httpProxy from 'http-proxy';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Socket } from 'node:net';
 import {
@@ -72,6 +73,8 @@ import {
   volDelete,
   volUploadFile,
   volExtractArchive,
+  volCheckArchive,
+  safeVolPath,
   volDownloadFile,
   volBackupStream,
   volRestoreArchive,
@@ -93,6 +96,7 @@ import { createSession, getSession, destroySession, destroyUserSessions, SESSION
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 import { BUILD_REVISION, CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { UPDATE_MESSAGE } from './self-update.js';
+import { GiB, MiB, declaredLength, readBody, receiveFile, spoolUpload, cleanSpoolDir, type Spooled } from './upload.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 import { createVncRejectLimiter, type VncRejectReason } from './vnc-reject.js';
 import { createStuckHealer } from './stuck-heal.js';
@@ -114,6 +118,7 @@ function basicAuth(inst: Instance) {
 }
 
 initStore();
+cleanSpoolDir(); // 上次异常退出时没收完 / 没处理完的上传暂存
 
 const app = Fastify({ logger: true, trustProxy: true });
 
@@ -134,8 +139,9 @@ app.addHook('onRequest', async (req, reply) => {
 });
 
 await app.register(cookie);
-// 文件上传走原始二进制（前端以 application/octet-stream 直传 File）
-app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+// 文件上传走原始二进制（前端以 application/octet-stream 直传 File）。解析器不读取，把请求流原样交给路由，
+// 由路由边收边处理（见 upload.ts）；注意这种解析器不受 bodyLimit 约束，各路由自己限长。
+app.addContentTypeParser('application/octet-stream', (_req, payload, done) => done(null, payload));
 // Heartbeat and other no-body POST routes send no Content-Type; fall through to this wildcard
 // instead of being rejected with 415. Fastify's exact-match parsers above take priority.
 app.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, _body, done) => done(null, null));
@@ -157,6 +163,20 @@ function requireAuth(req: FastifyRequest, reply: FastifyReply): User | null {
     return null;
   }
   return u;
+}
+
+// ---------- 上传 ----------
+const UPLOAD_LIMIT_TRANSFER = 4 * GiB; // 桌面文件中转（有实例访问权限的人都能传）
+const UPLOAD_LIMIT_VOL_FILE = 20 * GiB; // 数据卷里上传单个文件（管理员）
+const UPLOAD_LIMIT_ARCHIVE = 100 * GiB; // 上传并解压 / 整卷恢复（管理员；先暂存到面板数据目录，受那里的剩余空间约束）
+
+// 上传路由的响应一律带 connection: close：出错提前返回时，不必把客户端还在发的几个 GB 收完再回
+function uploadRoute(reply: FastifyReply): void {
+  reply.header('connection', 'close');
+}
+function sendUploadError(reply: FastifyReply, e: any, fallback: string) {
+  const code = Number(e?.statusCode);
+  return reply.code(code >= 400 && code < 600 ? code : 400).send({ error: e?.message || fallback });
 }
 
 function requireAdmin(req: FastifyRequest, reply: FastifyReply): User | null {
@@ -666,19 +686,21 @@ app.post('/api/admin/instances/:id/users', async (req, reply) => {
 
 // ---------- 文件中转（有访问权限即可用；走面板鉴权，不额外暴露） ----------
 // 上传：原始二进制直传，落到实例 ~/Desktop，微信文件选择器可直接选到。
-app.post('/api/instances/:id/upload', { bodyLimit: 512 * 1024 * 1024 }, async (req, reply) => {
+// 流式：边收边写进实例，面板内存不随文件大小增长；收完整了才出现在桌面上（见 docker.ts putFileStream）。
+app.post('/api/instances/:id/upload', async (req, reply) => {
+  uploadRoute(reply);
   const u = requireAuth(req, reply);
   if (!u) return;
   const id = (req.params as any).id;
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
   const name = String((req.query as any)?.name || '').trim();
-  const body = req.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件或格式错误' });
   try {
-    await uploadToInstance(findInstance(id)!, name, body);
+    await receiveFile(req, UPLOAD_LIMIT_TRANSFER, (size, body) => uploadToInstance(inst, name, size, body));
     return { ok: true };
   } catch (e: any) {
-    return reply.code(400).send({ error: e?.message || '上传失败' });
+    return sendUploadError(reply, e, '上传失败');
   }
 });
 
@@ -801,20 +823,25 @@ app.get('/api/instances/:id/clipboard-image', async (req, reply) => {
   }
 });
 
-app.post('/api/instances/:id/paste-image' , { bodyLimit: MAX_PASTE_IMAGE_BYTES }, async (req, reply) => {
+app.post('/api/instances/:id/paste-image', async (req, reply) => {
+  uploadRoute(reply);
   const u = requireAuth(req, reply);
   if (!u) return;
+  // octet-stream 不再整体缓冲（见 upload.ts）：先按声明长度拒绝超限，再按上限读入内存
+  if ((declaredLength(req) ?? 0) > MAX_PASTE_IMAGE_BYTES) return reply.code(413).send({ error: '图片过大', outcome: 'not-started' });
   const id = (req.params as any).id;
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例', outcome: 'not-started' });
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在', outcome: 'not-started' });
   const mime = (req.query as any)?.type;
   try {
-    validatePasteImage(mime, req.body);
-    await pasteImageInInstance(inst, mime, req.body);
+    const body = await readBody(req, MAX_PASTE_IMAGE_BYTES);
+    validatePasteImage(mime, body);
+    await pasteImageInInstance(inst, mime, body);
     return { ok: true, outcome: 'dispatched' };
-  } catch (e) {
+  } catch (e: any) {
     if (e instanceof PasteError) return reply.code(e.statusCode).send({ error: e.message, outcome: e.outcome });
+    if (Number(e?.statusCode) === 413) return reply.code(413).send({ error: e.message, outcome: 'not-started' });
     return reply.code(400).send({ error: '实例不支持图片粘贴', outcome: 'not-started' });
   }
 });
@@ -965,35 +992,105 @@ app.get('/api/admin/instances/:id/volume/download', async (req, reply) => {
 });
 
 // 上传单个文件到当前目录（原始二进制；落地为 abc 属主）
-app.post('/api/admin/instances/:id/volume/upload', { bodyLimit: 2 * 1024 * 1024 * 1024 }, async (req, reply) => {
+app.post('/api/admin/instances/:id/volume/upload', async (req, reply) => {
+  uploadRoute(reply);
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   const path = String((req.query as any)?.path || '');
   const name = String((req.query as any)?.name || '').trim();
-  const body = req.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件或格式错误' });
   try {
-    await volUploadFile(inst, path, name, body);
+    await receiveFile(req, UPLOAD_LIMIT_VOL_FILE, (size, body) => volUploadFile(inst, path, name, size, body));
     return { ok: true };
   } catch (e: any) {
-    return reply.code(400).send({ error: e?.message || '上传失败' });
+    return sendUploadError(reply, e, '上传失败');
   }
 });
 
+// ---------- 数据卷：上传并解压 / 整卷恢复（后台任务） ----------
+// 压缩包先完整收下、暂存到面板数据目录，校验通过后再写进实例：直接边收边解的话，上传中途断开会留下解了一半的
+// 数据（整卷恢复时就是一个半新半旧、微信打不开的卷），包本身坏了也要写到一半才发现。
+// 收完之后的校验和写入在后台做，接口立即返回任务号，前端轮询进度：几十 GB 的包要写好几分钟，同步等的话
+// 反代的读超时（nginx 默认 60 秒）会先把请求掐掉，前端报失败、实际却还在写。
+interface VolJob {
+  id: string;
+  instId: string;
+  kind: 'extract' | 'restore';
+  state: 'running' | 'done' | 'error';
+  stage: string;
+  error?: string;
+  endedAt?: number;
+}
+const volJobs = new Map<string, VolJob>();
+// 正在接收压缩包、或其后台任务还没结束的实例：同一实例同时只做一件（恢复会停掉实例，另一边的解压就会失败）
+const volBusy = new Set<string>();
+function startVolJob(instId: string, kind: VolJob['kind'], work: (stage: (s: string) => void) => Promise<void>): VolJob {
+  const now = Date.now();
+  for (const [k, j] of volJobs) if (j.endedAt && now - j.endedAt > 60 * 60 * 1000) volJobs.delete(k);
+  const job: VolJob = { id: randomUUID(), instId, kind, state: 'running', stage: '校验压缩包' };
+  volJobs.set(job.id, job);
+  work((s) => {
+    job.stage = s;
+  })
+    .then(
+      () => {
+        job.state = 'done';
+      },
+      (e: any) => {
+        job.state = 'error';
+        job.error = e?.message || String(e);
+      },
+    )
+    .finally(() => {
+      job.endedAt = Date.now();
+      volBusy.delete(instId);
+    });
+  return job;
+}
+// 收压缩包（暂存到面板数据目录）；期间把实例标为忙，收失败就撤销
+async function receiveVolArchive(instId: string, req: FastifyRequest): Promise<Spooled> {
+  if (volBusy.has(instId)) throw Object.assign(new Error('该实例还有一个解压 / 恢复在进行，请等它完成再试'), { statusCode: 409 });
+  volBusy.add(instId);
+  try {
+    return await spoolUpload(req, UPLOAD_LIMIT_ARCHIVE);
+  } catch (e) {
+    volBusy.delete(instId);
+    throw e;
+  }
+}
+
+app.get('/api/admin/instances/:id/volume/jobs/:job', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const job = volJobs.get((req.params as any).job);
+  if (!job || job.instId !== (req.params as any).id) return reply.code(404).send({ error: '任务不存在（面板可能重启过）' });
+  return { state: job.state, stage: job.stage, error: job.error || null };
+});
+
 // 上传压缩包并解压到当前目录（.tar / .tar.gz；PC 微信数据迁移用）
-app.post('/api/admin/instances/:id/volume/extract', { bodyLimit: 3 * 1024 * 1024 * 1024 }, async (req, reply) => {
+app.post('/api/admin/instances/:id/volume/extract', async (req, reply) => {
+  uploadRoute(reply);
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
-  const body = req.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件或格式错误' });
+  const rel = String((req.query as any)?.path || '');
+  let spool: Spooled;
   try {
-    await volExtractArchive(inst, String((req.query as any)?.path || ''), body);
-    return { ok: true };
+    safeVolPath(rel);
+    if ((await instanceRuntime(inst)) !== 'running') return reply.code(409).send({ error: '实例未运行，请先启动实例' });
+    spool = await receiveVolArchive(inst.id, req);
   } catch (e: any) {
-    return reply.code(400).send({ error: e?.message || '解压失败（请确认是 .tar 或 .tar.gz）' });
+    return sendUploadError(reply, e, '上传失败');
   }
+  const job = startVolJob(inst.id, 'extract', async (stage) => {
+    try {
+      const info = await volCheckArchive(spool.path, 'extract');
+      stage('写入数据');
+      await volExtractArchive(inst, rel, spool.path, info);
+    } finally {
+      spool.dispose();
+    }
+  });
+  return { ok: true, job: job.id };
 });
 
 // 整卷备份：流式下载 /config 为 .tar.gz
@@ -1011,19 +1108,33 @@ app.get('/api/admin/instances/:id/volume/backup', async (req, reply) => {
   }
 });
 
-// 整卷恢复：上传本系统导出的 .tar.gz 备份（要求实例已停止）
-app.post('/api/admin/instances/:id/volume/restore', { bodyLimit: 3 * 1024 * 1024 * 1024 }, async (req, reply) => {
-  if (!requireAdmin(req, reply)) return;
+// 整卷恢复：上传本系统导出的 .tar.gz 备份。写入前自动停止实例、写完自动启动（原本在运行的话）。
+app.post('/api/admin/instances/:id/volume/restore', async (req, reply) => {
+  uploadRoute(reply);
+  const admin = requireAdmin(req, reply);
+  if (!admin) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
-  const body = req.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件或格式错误' });
+  let spool: Spooled;
   try {
-    await volRestoreArchive(inst, body);
-    return { ok: true };
+    if ((await instanceRuntime(inst)) === 'missing') return reply.code(409).send({ error: '实例容器不存在：请先在卡片上启动一次实例，再恢复' });
+    spool = await receiveVolArchive(inst.id, req);
   } catch (e: any) {
-    return reply.code(400).send({ error: e?.message || '恢复失败' });
+    return sendUploadError(reply, e, '上传失败');
   }
+  const job = startVolJob(inst.id, 'restore', async (stage) => {
+    try {
+      const info = await volCheckArchive(spool.path, 'restore');
+      appendPanelLog('INFO', `实例「${inst.name}」(id=${inst.id}) 由 ${admin.username} 整卷恢复（备份校验通过）`);
+      await volRestoreArchive(inst, spool.path, info, stage);
+    } catch (e: any) {
+      appendPanelLog('ERROR', `实例「${inst.name}」(id=${inst.id}) 整卷恢复失败：${e?.message || e}`);
+      throw e;
+    } finally {
+      spool.dispose();
+    }
+  });
+  return { ok: true, job: job.id };
 });
 
 // 该实例的微信安装状态（有访问权限即可看）
@@ -1077,17 +1188,18 @@ app.get('/api/admin/instances/:id/backgrounds', async (req, reply) => {
   catch (e: any) { return reply.code(500).send({ error: e?.message || '列出壁纸失败' }); }
 });
 
-app.post('/api/admin/instances/:id/backgrounds', { bodyLimit: 50 * 1024 * 1024 }, async (req, reply) => {
+app.post('/api/admin/instances/:id/backgrounds', async (req, reply) => {
+  uploadRoute(reply);
   if (!requireAdmin(req, reply)) return;
   const inst = bgHandler((req.params as any).id, reply);
   if (!inst) return;
   const name = String((req.query as any)?.name || '').trim();
-  const body = req.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件' });
   try {
+    const body = await readBody(req, 50 * MiB);
+    if (!body.length) return reply.code(400).send({ error: '空文件' });
     await uploadBackground(inst, name, body);
     return { ok: true };
-  } catch (e: any) { return reply.code(400).send({ error: e?.message || '上传失败' }); }
+  } catch (e: any) { return sendUploadError(reply, e, '上传失败'); }
 });
 
 app.get('/api/admin/instances/:id/backgrounds/current', async (req, reply) => {
@@ -1152,17 +1264,18 @@ app.get('/api/admin/instances/:id/fonts', async (req, reply) => {
   catch (e: any) { return reply.code(500).send({ error: e?.message || '列出字体失败' }); }
 });
 
-app.post('/api/admin/instances/:id/fonts', { bodyLimit: 50 * 1024 * 1024 }, async (req, reply) => {
+app.post('/api/admin/instances/:id/fonts', async (req, reply) => {
+  uploadRoute(reply);
   if (!requireAdmin(req, reply)) return;
   const inst = bgHandler((req.params as any).id, reply);
   if (!inst) return;
   const name = String((req.query as any)?.name || '').trim();
-  const body = req.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件' });
   try {
+    const body = await readBody(req, 50 * MiB);
+    if (!body.length) return reply.code(400).send({ error: '空文件' });
     await uploadFont(inst, name, body);
     return { ok: true };
-  } catch (e: any) { return reply.code(400).send({ error: e?.message || '上传失败' }); }
+  } catch (e: any) { return sendUploadError(reply, e, '上传失败'); }
 });
 
 app.delete('/api/admin/instances/:id/fonts/:name', async (req, reply) => {

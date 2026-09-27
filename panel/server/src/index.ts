@@ -718,10 +718,11 @@ app.get('/api/instances/:id/download', async (req, reply) => {
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
   const name = String((req.query as any)?.name || '').trim();
   try {
-    const buf = await downloadFromInstance(findInstance(id)!, name);
+    const { size, stream } = await downloadFromInstance(findInstance(id)!, name);
     reply.header('content-type', 'application/octet-stream');
+    reply.header('content-length', String(size));
     reply.header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
-    return reply.send(buf);
+    return reply.send(stream);
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '下载失败' });
   }
@@ -953,10 +954,11 @@ app.get('/api/admin/instances/:id/volume/download', async (req, reply) => {
   const path = String((req.query as any)?.path || '');
   const name = path.split('/').filter(Boolean).pop() || 'file';
   try {
-    const buf = await volDownloadFile(inst, path);
+    const { size, stream } = await volDownloadFile(inst, path);
     reply.header('content-type', 'application/octet-stream');
+    reply.header('content-length', String(size));
     reply.header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
-    return reply.send(buf);
+    return reply.send(stream);
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '下载失败' });
   }

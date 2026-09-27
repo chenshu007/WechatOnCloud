@@ -5,6 +5,7 @@ import { hostname } from 'node:os';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, readPanelLog, filterSince } from './logs.js';
 import http from 'node:http';
+import { PassThrough } from 'node:stream';
 import zlib from 'node:zlib';
 import Docker from 'dockerode';
 import { instanceAppType, requireSupportedApp, type Instance } from './store.js';
@@ -834,17 +835,56 @@ export async function deleteInstanceFile(inst: Instance, name: string): Promise<
   await execCapture(inst, ['rm', '-f', `${TRANSFER_DIR}/${name}`]);
 }
 
-export async function downloadFromInstance(inst: Instance, name: string): Promise<Buffer> {
-  if (!safeName(name)) throw new Error('文件名不合法');
-  const c = docker.getContainer(inst.containerName);
-  const stream = (await c.getArchive({ path: `${TRANSFER_DIR}/${name}` })) as NodeJS.ReadableStream;
-  const chunks: Buffer[] = [];
-  await new Promise<void>((resolve, reject) => {
-    stream.on('data', (d: Buffer) => chunks.push(d));
-    stream.on('end', () => resolve());
-    stream.on('error', reject);
+// 以流的形式读出容器里的一个普通文件，不整个读进内存。微信收到的视频、文件动辄几百 MB 到 GB，此前先把整个 tar 读进
+// 内存再解出文件，面板进程峰值约为文件大小的两倍，NAS 上容易被 OOM 杀掉，所有人的桌面跟着断。
+// 走 docker exec cat：输出按 docker 的 stdout/stderr 分帧，这里自己拆帧，并在下游写不动时暂停读取（慢速客户端不在内存里堆积）。
+// 先 stat：只放行普通文件（不跟随符号链接，与 getArchive 一致），出错能在发出响应头之前报。
+export async function streamRegularFile(inst: Instance, absPath: string): Promise<{ size: number; stream: NodeJS.ReadableStream }> {
+  const st = await execCapture(inst, ['stat', '-c', '%F|%s', '--', absPath], 'root').catch(() => '');
+  if (!st) throw new Error('文件不存在或已被删除');
+  const [kind, size] = st.trim().split('|');
+  if (kind !== 'regular file' && kind !== 'regular empty file') throw new Error('不是普通文件');
+  const exec = await execCreate(docker.getContainer(inst.containerName), {
+    Cmd: ['cat', '--', absPath],
+    AttachStdout: true,
+    AttachStderr: true,
+    Tty: false,
+    User: 'root',
   });
-  return extractSingleFileFromTar(Buffer.concat(chunks));
+  const raw = (await exec.start({ hijack: true, stdin: false })) as NodeJS.ReadableStream & { destroy?: () => void };
+  const out = new PassThrough();
+  let buf: Buffer = Buffer.alloc(0);
+  let need = 0; // 当前帧还剩多少字节
+  let type = 0; // 1 = stdout，2 = stderr
+  raw.on('data', (chunk: Buffer) => {
+    buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+    for (;;) {
+      if (need === 0) {
+        if (buf.length < 8) break;
+        type = buf[0];
+        need = buf.readUInt32BE(4);
+        buf = buf.subarray(8);
+        continue;
+      }
+      if (!buf.length) break;
+      const part = buf.subarray(0, need);
+      buf = buf.subarray(part.length);
+      need -= part.length;
+      if (type === 1 && !out.write(part)) {
+        raw.pause();
+        out.once('drain', () => raw.resume());
+      }
+    }
+  });
+  raw.on('end', () => out.end());
+  raw.on('error', (e) => out.destroy(e as Error));
+  out.on('close', () => raw.destroy?.()); // 客户端中途断开：停掉 cat
+  return { size: Number(size) || 0, stream: out };
+}
+
+export async function downloadFromInstance(inst: Instance, name: string): Promise<{ size: number; stream: NodeJS.ReadableStream }> {
+  if (!safeName(name)) throw new Error('文件名不合法');
+  return streamRegularFile(inst, `${TRANSFER_DIR}/${name}`);
 }
 
 // 从 docker getArchive 返回的 tar 中取出第一个普通文件的内容。Docker(Go archive/tar) 在 mtime 含纳秒精度等
@@ -1065,17 +1105,10 @@ export async function volExtractArchive(inst: Instance, rel: string, archive: Bu
   await docker.getContainer(inst.containerName).putArchive(maybeGunzip(archive), { path: dir });
 }
 
-export async function volDownloadFile(inst: Instance, rel: string): Promise<Buffer> {
+export async function volDownloadFile(inst: Instance, rel: string): Promise<{ size: number; stream: NodeJS.ReadableStream }> {
   const abs = safeVolPath(rel);
   if (abs === VOL_ROOT) throw new Error('不能下载整个根目录，请用整卷备份');
-  const stream = (await docker.getContainer(inst.containerName).getArchive({ path: abs })) as NodeJS.ReadableStream;
-  const chunks: Buffer[] = [];
-  await new Promise<void>((resolve, reject) => {
-    stream.on('data', (d: Buffer) => chunks.push(d));
-    stream.on('end', () => resolve());
-    stream.on('error', reject);
-  });
-  return extractSingleFileFromTar(Buffer.concat(chunks));
+  return streamRegularFile(inst, abs);
 }
 
 // 整卷备份：把 /config 打成 tar 流并经 gzip 输出（路由直接 pipe 给响应，避免大文件入内存）。

@@ -237,6 +237,8 @@ app.post('/api/account/password', async (req, reply) => {
   if (!verifyPassword(u, oldPassword ?? '')) return reply.code(400).send({ error: '原密码错误' });
   if (!newPassword || String(newPassword).length < 6) return reply.code(400).send({ error: '新密码至少 6 位' });
   resetPassword(u.id, newPassword);
+  // 改密码多半是怀疑泄露：其他设备上已登录的会话一并作废（会话滑动续期，不踢掉的话一直用着就永不过期），当前这个保留
+  destroyUserSessions(u.id, req.cookies?.[COOKIE]);
   return { ok: true };
 });
 

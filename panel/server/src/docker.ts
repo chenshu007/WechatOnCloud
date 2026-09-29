@@ -1154,16 +1154,27 @@ export async function volUploadFile(inst: Instance, rel: string, name: string, s
 // 没有设备文件；整卷恢复还要求所有条目都在 config/ 下（本系统备份的格式）。此前不校验直接解到容器根目录，
 // 传错了包（比如把 PC 微信文件夹的压缩包当备份传上去）就散落进容器的系统目录。
 // 返回解压后普通文件的总字节数，用来预先检查目标盘空间。
-export async function volCheckArchive(path: string, mode: 'extract' | 'restore'): Promise<{ gzip: boolean; bytes: number }> {
+export interface ArchiveInfo {
+  gzip: boolean;
+  bytes: number;
+  tops: string[] | null; // 解出来的顶层条目名（解压后改属主用）；太多时为 null
+}
+export async function volCheckArchive(path: string, mode: 'extract' | 'restore'): Promise<ArchiveInfo> {
   const kind = await sniffArchive(path);
   if (kind === 'zip') throw new Error('暂不支持 zip，请打包成 .tar 或 .tar.gz 后再上传');
   if (kind === 'other') throw new Error('不是 .tar / .tar.gz 压缩包（或文件已损坏）');
   const gzip = kind === 'gzip';
   let entries = 0;
   let bytes = 0;
+  const tops = new Set<string>();
+  let manyTops = false;
   await scanArchive(path, gzip, (e) => {
     entries++;
     const segs = e.name.split('/').filter((x) => x && x !== '.');
+    if (segs.length && !manyTops) {
+      tops.add(segs[0]);
+      if (tops.size > 200) manyTops = true;
+    }
     if (segs.includes('..') || (e.type === '1' && e.linkname.split('/').includes('..'))) {
       throw new Error(`压缩包里有越出目标目录的路径（${e.name}），已拒绝`);
     }
@@ -1174,12 +1185,12 @@ export async function volCheckArchive(path: string, mode: 'extract' | 'restore')
     bytes += e.size;
   });
   if (!entries) throw new Error('压缩包是空的');
-  return { gzip, bytes };
+  return { gzip, bytes, tops: manyTops ? null : [...tops] };
 }
 
 // 上传压缩包并解压到指定目录（PC 微信数据迁移：用户把文件夹打成 .tar/.tar.gz 上传）。
 // putArchive 把 tar 内容解到 dir 下，Docker 解包限制在 dir 内、防 .. 穿越。gzip 在面板里流式解开。
-export async function volExtractArchive(inst: Instance, rel: string, archivePath: string, info: { gzip: boolean; bytes: number }): Promise<void> {
+export async function volExtractArchive(inst: Instance, rel: string, archivePath: string, info: ArchiveInfo): Promise<void> {
   const dir = safeVolPath(rel);
   await execCapture(inst, ['mkdir', '-p', dir]).catch((e) => {
     throw friendlyWriteError(e);
@@ -1192,6 +1203,25 @@ export async function volExtractArchive(inst: Instance, rel: string, archivePath
     throw friendlyWriteError(e);
   } finally {
     tar.destroy();
+  }
+  // putArchive 按压缩包里记录的属主落地：在 NAS 上用 root 打的包解出来是 root，Mac 上打的是 501。应用以 abc 运行，
+  // 写不了这些文件——迁移过来的微信数据库打不开 / 写不进去。解完把这次解出来的东西改成 abc（-h：符号链接只改它自己，
+  // 不跟过去）；实例的设备标识文件 .woc-machine-id 本来就属于 root，不动。
+  const own = ['chown', '-R', '-h', 'abc:abc', '--'];
+  let run: string[] | null;
+  if (info.tops) {
+    const paths = info.tops.filter((t) => !(dir === VOL_ROOT && t === '.woc-machine-id')).map((t) => `${dir}/${t}`);
+    run = paths.length ? [...own, ...paths] : null;
+  } else if (dir === VOL_ROOT) {
+    // 顶层条目太多（>200）没记全：卷根下除设备标识外全部改一遍（卷里本来就都该是 abc 的）
+    run = ['find', VOL_ROOT, '-mindepth', '1', '-maxdepth', '1', '!', '-name', '.woc-machine-id', '-exec', ...own.slice(0, -1), '{}', '+'];
+  } else {
+    run = [...own, dir];
+  }
+  if (run) {
+    await execCapture(inst, run, 'root').catch((e) => {
+      throw new Error(`文件已解压，但没能把属主改成应用用户（${e?.message || e}），应用可能改不了这些文件，请重试`);
+    });
   }
 }
 

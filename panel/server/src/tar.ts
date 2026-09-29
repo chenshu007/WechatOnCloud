@@ -15,14 +15,23 @@ export const pad512 = (n: number): Buffer => Buffer.alloc(padLen(n), 0);
 
 export class TarError extends Error {}
 
+// 属主写实例里 abc 用户的 uid / gid：面板把自己的 PUID / PGID 原样传给实例（见 docker.ts），默认 1000。
+// 此前写死 1000，PUID 设成别的（群晖常见 1026）时传进去的文件属于另一个用户，应用删不掉也改不了。
+const ownerField = (v: string | undefined): string => {
+  const n = Number(v || '1000');
+  return (Number.isInteger(n) && n >= 0 && n <= 0o7777777 ? n : 1000).toString(8).padStart(7, '0') + '\0';
+};
+const UID_FIELD = ownerField(process.env.PUID);
+const GID_FIELD = ownerField(process.env.PGID);
+
 function ustarHeader(name: string, size: number, type: string, mtime: number): Buffer {
   const h = Buffer.alloc(BLOCK, 0);
   // 名字字段只有 100 字节：最多写 100 字节，且不写半个 UTF-8 字符（完整名字另放 PAX 头）。
   // 此前不限长度直接写，超长中文名会一路写进后面的 linkname / uname 字段，文件名也被截成半个字。
   h.write(name, 0, 100, 'utf8');
   h.write('0000644\0', 100); // mode
-  h.write('0001750\0', 108); // uid 1000（abc）
-  h.write('0001750\0', 116); // gid 1000
+  h.write(UID_FIELD, 108);
+  h.write(GID_FIELD, 116);
   h.write((size > MAX_OCTAL_SIZE ? 0 : size).toString(8).padStart(11, '0') + '\0', 124);
   // mtime 必须写当前时间：写 0 的话上传的文件全是 1970 年，按时间排序时刚上传的反而沉到最底下
   h.write(mtime.toString(8).padStart(11, '0') + '\0', 136);

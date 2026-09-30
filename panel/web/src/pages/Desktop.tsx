@@ -1,3 +1,4 @@
+import { installImagePasteBridge } from '../image-paste-bridge';
 import { fatalErrorMsg } from '../vnc-errors';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -137,11 +138,17 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const isAdmin = user?.role === 'admin';
 
   const [frameLoaded, setFrameLoaded] = useState(false);
+  const [frameGeneration, setFrameGeneration] = useState(0);
+  const [pasteFallback, setPasteFallback] = useState<File | null>(null);
+  const [showImagePaste, setShowImagePaste] = useState(false);
+  const [imageBusy, setImageBusy] = useState(false);
+  const pasteBox = useRef<HTMLDivElement>(null);
   const [loadStuck, setLoadStuck] = useState(false); // iframe 久未加载出来（疑似实例无响应）
   const [dragging, setDragging] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [files, setFiles] = useState<TFile[]>([]);
   const [showClip, setShowClip] = useState(false);
+  const [clipTab, setClipTab] = useState<'text' | 'image'>('text');
   const [clipText, setClipText] = useState('');
   // 中文输入模式：'forward'=底部输入条转发（默认，最稳）；'seamless'=无感（直接在微信里打，提交后转发）。
   const [inputMode, setInputMode] = useState<'forward' | 'seamless'>(() => {
@@ -240,6 +247,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   // 切换实例时重置内嵌态
   useEffect(() => {
     setFrameLoaded(false);
+    setPasteFallback(null);
     setLoadStuck(false);
     setShowFiles(false);
     setFiles([]);
@@ -343,6 +351,77 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     return () => window.removeEventListener('paste', onPaste);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showVnc]);
+
+  const pasteImageFile = async (file: File) => {
+    if (!id || imageBusy) return;
+    setImageBusy(true);
+    try {
+      await api.pasteImage(id, file);
+      setPasteFallback(null); setShowImagePaste(false);
+      toast('已执行图片粘贴，请检查微信输入框（未发送）', 'ok');
+    } catch (e) {
+      setPasteFallback(new File([file], `粘贴图片-${Date.now()}.png`, {type:file.type}));
+      toast(e instanceof Error ? e.message : '图片粘贴失败', 'error');
+    } finally { setImageBusy(false); }
+  };
+  const pasteLocalImage = () => {
+    setShowClip(true); setClipTab('image'); setShowImagePaste(true);
+    if (!navigator.clipboard?.read) { requestAnimationFrame(() => pasteBox.current?.focus()); return; }
+    // Invocation must remain in this click gesture, including on Safari.
+    const reading = navigator.clipboard.read();
+    setImageBusy(true);
+    void reading.then(async items => {
+      const item = items.find(i => i.types.includes('image/png'));
+      if (!item) throw new Error('剪贴板没有图片；可在下方粘贴框内按 Ctrl+V');
+      const blob = await item.getType('image/png');
+      if (!id) return;
+      const file = new File([blob], 'clipboard.png', {type:'image/png'});
+      try { await api.pasteImage(id, file); }
+      catch (e) { setPasteFallback(file); throw e; }
+      setShowImagePaste(false); toast('已执行图片粘贴，请检查微信输入框（未发送）', 'ok');
+    }).catch(e => {
+      toast(e instanceof Error ? e.message : '请在下方粘贴框内按 Ctrl+V', 'error');
+      requestAnimationFrame(() => pasteBox.current?.focus());
+    }).finally(() => setImageBusy(false));
+  };
+  const copyRemoteImage = () => {
+    if (!id || imageBusy) return;
+    if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+      toast('复制图片需要 HTTPS 和浏览器剪贴板权限', 'error'); return;
+    }
+    setImageBusy(true);
+    // Promise-valued ClipboardItem keeps write inside the click activation.
+    const image = api.clipboardImage(id);
+    void image.catch(() => {});
+    void navigator.clipboard.write([new ClipboardItem({'image/png': image})])
+      .then(() => toast('已复制微信图片到本机剪贴板', 'ok'))
+      .catch(e => toast(e instanceof Error ? e.message : '复制图片失败，请检查剪贴板权限', 'error'))
+      .finally(() => setImageBusy(false));
+  };
+
+  // Direct image paste is confined to the desktop iframe. The parent page's
+  // existing paste-to-file handler and the file upload button remain available.
+  useEffect(() => {
+    if (!showVnc || !frameLoaded || !id) return;
+    const win = frameRef.current?.contentWindow;
+    const doc = frameRef.current?.contentDocument;
+    if (!win || !doc) return;
+    let alive = true;
+    const cleanup = installImagePasteBridge(win, doc, window, {
+      image: async file => {
+        try {
+          await api.pasteImage(id, file);
+          if (alive) { setPasteFallback(null); toast('已执行图片粘贴，请检查微信输入框（未发送）', 'ok'); }
+        } catch (e) {
+          if (alive) { setShowClip(true); setClipTab('image'); setPasteFallback(new File([file], `粘贴图片-${Date.now()}.${file.type.split('/')[1] || 'png'}`, {type:file.type})); }
+          throw e;
+        }
+      },
+      plain: async () => { await api.keyInInstance(id, 'ctrl+v'); },
+      error: message => { if (alive) { setShowClip(true); setClipTab('image'); toast(message, 'error'); } },
+    });
+    return () => { alive = false; cleanup(); };
+  }, [showVnc, frameLoaded, frameGeneration, id]);
 
   // 控制权（交互驱动的心跳软锁）：每 3s 只读轮询当前操作者；超 TTL 自动释放。
   useEffect(() => {
@@ -885,8 +964,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               输入：{inputMode === 'seamless' ? '无感' : '转发'}
             </button>
             <button
-              className="ws-action"
-              title="把文本发送到容器剪贴板（局域网 http 下也可用）"
+              className={'ws-action' + (showClip ? ' on' : '')}
+              title="传输文本或图片"
               onClick={() => setShowClip((v) => !v)}
             >
               剪贴板
@@ -1006,6 +1085,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
             allow="clipboard-read; clipboard-write; microphone; camera; autoplay"
             onLoad={() => {
               setFrameLoaded(true);
+              setFrameGeneration(v => v + 1);
               if (id) api.clientLog(id, 'iframe 已加载（noVNC 页面就绪，开始连 VNC）');
               setTimeout(() => {
                 focusFrame(); // 加载完把键盘焦点交给 VNC
@@ -1118,13 +1198,18 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
           )}
 
           {showClip && (
-            <div className="iv-files">
+            <div className="iv-files iv-clipboard">
               <div className="files-head">
-                <span>文本剪贴板</span>
+                <span>剪贴板</span>
                 <button className="btn-text" onClick={() => setShowClip(false)}>
                   关闭
                 </button>
               </div>
+              <div className="settings-tabs" role="tablist" aria-label="剪贴板内容类型">
+                <button id="clip-text-tab" role="tab" aria-selected={clipTab === 'text'} aria-controls="clip-text-panel" className={'settings-tab' + (clipTab === 'text' ? ' on' : '')} onClick={() => setClipTab('text')}>文本</button>
+                <button id="clip-image-tab" role="tab" aria-selected={clipTab === 'image'} aria-controls="clip-image-panel" className={'settings-tab' + (clipTab === 'image' ? ' on' : '')} onClick={() => setClipTab('image')}>图片</button>
+              </div>
+              {clipTab === 'text' ? <div id="clip-text-panel" className="clip-panel" role="tabpanel" aria-labelledby="clip-text-tab">
               <textarea
                 className="clip-area"
                 value={clipText}
@@ -1141,6 +1226,33 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               <div className="files-hint">
                 局域网 http 访问时浏览器会禁用系统级剪贴板同步，故用此框中转：文本→容器剪贴板，再在应用里 Ctrl+V。
               </div>
+              </div> : <div id="clip-image-panel" className="clip-panel" role="tabpanel" aria-labelledby="clip-image-tab">
+              <div className="clip-image-actions">
+                <button className="btn btn-primary" disabled={imageBusy} onClick={pasteLocalImage}>
+                  {imageBusy ? '处理中…' : '粘贴图片'}
+                </button>
+                <button className="btn" disabled={imageBusy} onClick={copyRemoteImage}>复制微信图片</button>
+              </div>
+              <div className="files-hint">粘贴前先点选微信输入框；复制前先在微信内复制图片。</div>
+      {showImagePaste && <div className="clip-image-entry" role="status">
+        <span className="files-hint">点击下方区域，按 Ctrl+V 粘贴图片。</span>
+        <div ref={pasteBox} contentEditable suppressContentEditableWarning role="textbox"
+          aria-label="图片粘贴框" tabIndex={0} className="clip-image-box" data-placeholder="在这里粘贴图片"
+          onPaste={e => {
+            e.preventDefault(); e.stopPropagation();
+            if (imageBusy) return;
+            const file = Array.from(e.clipboardData.items).find(i => i.kind === 'file' && i.type.startsWith('image/'))?.getAsFile();
+            if (file) void pasteImageFile(file);
+            else toast('剪贴板未提供图片，请复制图片内容后重试', 'error');
+          }} />
+        <button className="btn-text clip-secondary" disabled={imageBusy} onClick={() => setShowImagePaste(false)}>收起粘贴框</button>
+      </div>}
+      {pasteFallback && <div className="clip-image-fallback" role="status">
+        <span className="files-hint">图片粘贴未确认成功，请先检查微信输入框。</span>
+        <button className="btn" disabled={uploading} onClick={() => { const f = pasteFallback; setPasteFallback(null); void uploadFiles([f]); }}>改为上传图片文件</button>
+        <button className="btn-text" onClick={() => setPasteFallback(null)}>忽略</button>
+      </div>}
+              </div>}
             </div>
           )}
 

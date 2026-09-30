@@ -32,7 +32,9 @@ elif tool == 'df':
     print('Filesystem 1024-blocks Used Available Capacity Mounted on')
     print('test 20000000 10 %s 1%% /' % ('1' if scenario == 'disk-full' else '10000000'))
 elif tool == 'stat':
-    print(pathlib.Path(args[-1]).stat().st_size)
+    st = pathlib.Path(args[-1]).stat()
+    if '-Lc' in args: print(str(st.st_dev) + ' ' + str(st.st_ino))
+    else: print(st.st_size)
 elif tool == 'curl':
     if '-fsSLI' in args:
         print('Content-Length: 100')
@@ -41,6 +43,19 @@ elif tool == 'curl':
         prior = dest.read_bytes() if dest.exists() else b''
         record({'tool': tool, 'args': args, 'prior': prior.decode(), 'file': dest.name})
         if scenario == 'write-failure': sys.exit(23)
+        if scenario.startswith('unreachable-'):
+            code = int(scenario.split('-')[1]); print('000 0.000000'); sys.exit(code)
+        if scenario == 'mixed-network':
+            print('000 0.000000')
+            if 'fallback' in dest.name: sys.exit(6)
+            with dest.open('ab') as f: f.write(b'x' * 10)
+            sys.exit(56)
+        if scenario == 'connected-timeout': print('000 0.050000'); sys.exit(28)
+        if scenario == 'range-reset' and prior: sys.exit(33)
+        if scenario == 'slow-download':
+            (root/'started').write_text('yes')
+            import time
+            time.sleep(60)
         with dest.open('ab') as f: f.write(b'x' * 100)
         if scenario == 'network-failure': sys.exit(7)
         if scenario == 'resume' and not prior: sys.exit(7)
@@ -54,6 +69,10 @@ elif tool == 'dpkg-deb':
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text('test-new')
         target.chmod(0o755)
+elif tool == 'mv':
+    if scenario == 'swap-failure' and args[-2].endswith('/new'): sys.exit(1)
+    import shutil
+    shutil.move(args[-2], args[-1])
 elif tool == 'pkill':
     record({'tool': tool})
 else: sys.exit(99)
@@ -67,7 +86,7 @@ class InstallerTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        for tool in ['flock', 'dpkg', 'df', 'stat', 'curl', 'dpkg-deb', 'pkill']:
+        for tool in ['flock', 'dpkg', 'df', 'stat', 'curl', 'dpkg-deb', 'pkill', 'mv']:
             path = self.bin / tool
             path.write_text('#!' + sys.executable + '\n' + MOCK)
             path.chmod(0o755)
@@ -151,6 +170,81 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.status()['phase'], 'error')
         self.assertEqual(self.old_bin.read_text(), 'test-old')
         self.assertFalse(any(e['tool'] == 'pkill' for e in self.events()))
+
+    def test_both_mirrors_fail_before_transfer_stop_after_first_round(self):
+        for code in [5, 6, 7, 28, 35, 60]:
+            with self.subTest(code=code):
+                trace = self.root / 'trace.jsonl'
+                if trace.exists(): trace.unlink()
+                result = self.run_install('unreachable-' + str(code))
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(len(self.events()), 2)
+                self.assertIn('两个微信下载地址均不可用', self.status()['message'])
+                self.assertEqual(self.old_bin.read_text(), 'test-old')
+
+    def test_partial_on_one_mirror_never_classifies_both_as_unreachable(self):
+        self.run_install('mixed-network')
+        self.assertEqual(len(self.events()), 12)
+        self.assertTrue((self.work/'wechat-main.deb').stat().st_size > 0)
+        self.assertNotIn('均不可用', self.status()['message'])
+
+    def test_timeout_after_connect_is_not_connect_failure(self):
+        self.run_install('connected-timeout')
+        self.assertEqual(len(self.events()), 12)
+        self.assertNotIn('均不可用', self.status()['message'])
+        self.assertIn('请求超时', self.status()['message'])
+
+    def test_changed_url_cleans_only_that_mirrors_partial(self):
+        self.work.mkdir()
+        (self.work/'wechat-main.deb').write_text('old-partial')
+        (self.work/'wechat-main.deb.url').write_text('https://old.invalid/file')
+        self.run_install()
+        self.assertEqual(self.events()[0]['prior'], '')
+
+    def test_swap_failure_restores_original(self):
+        self.run_install('swap-failure')
+        self.assertEqual(self.old_bin.read_text(), 'test-old')
+        self.assertIn('已尝试恢复', self.status()['message'])
+        self.assertFalse(any(e['tool'] == 'pkill' for e in self.events()))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux kernel lock table')
+    def test_busy_status_recovers_without_writing_or_taking_lock(self):
+        for phase in ['busy', 'downloading', 'extracting', 'installing']:
+            with self.subTest(phase=phase):
+                state = json.dumps({'phase':phase, 'percent':92})
+                (self.state/'status.json').write_text(state)
+                with (self.state/'.install.flock').open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    r = subprocess.run(['bash',str(SCRIPT),'status'],env=self.env,capture_output=True,text=True)
+                    self.assertEqual(json.loads(r.stdout)['phase'],phase, r.stderr)
+                r = subprocess.run(['bash',str(SCRIPT),'status'],env=self.env,capture_output=True,text=True)
+                self.assertEqual(json.loads(r.stdout)['phase'],'error',r.stderr)
+                self.assertEqual((self.state/'status.json').read_text(),state)
+                self.assertEqual(self.old_bin.read_text(),'test-old')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux kernel lock table')
+    def test_killed_real_install_process_group_reports_retryable_status(self):
+        import time, signal
+        proc = subprocess.Popen(['bash',str(SCRIPT),'install'],env=dict(self.env,SCENARIO='slow-download'),
+                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        try:
+            for _ in range(200):
+                if (self.root/'started').exists(): break
+                time.sleep(0.02)
+            self.assertTrue((self.root/'started').exists())
+            r = subprocess.run(['bash',str(SCRIPT),'status'],env=self.env,capture_output=True,text=True)
+            self.assertEqual(json.loads(r.stdout)['phase'],'downloading',r.stderr)
+        finally:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+        time.sleep(0.1)
+        snapshot=(self.state/'status.json').read_bytes()
+        r = subprocess.run(['bash',str(SCRIPT),'status'],env=self.env,capture_output=True,text=True)
+        self.assertEqual(json.loads(r.stdout)['phase'],'error',r.stderr)
+        self.assertEqual((self.state/'status.json').read_bytes(),snapshot)
+        self.assertEqual(self.old_bin.read_text(),'test-old')
+        self.assertEqual(self.run_install().returncode,0)
+        self.assertEqual(self.status()['phase'],'done')
 
 
 if __name__ == '__main__':

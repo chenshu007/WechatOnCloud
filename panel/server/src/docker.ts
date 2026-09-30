@@ -1,3 +1,4 @@
+import { IMAGE_PASTE_SCRIPT, PasteError, validatePasteImage, withInstanceInput } from './image-paste.js';
 import { tarEntry, parseTransferFiles } from './transfer-format.js';
 import { StringDecoder } from 'node:string_decoder';
 import { hostname } from 'node:os';
@@ -498,11 +499,17 @@ async function execCreate(c: any, opts: any): Promise<any> {
 }
 
 // 在实例容器内执行命令，返回 stdout；若命令失败，把 stderr 透出给调用方。
-async function execCapture(inst: Instance, cmd: string[], user = 'abc'): Promise<string> {
+async function execCapture(inst: Instance, cmd: string[], user = 'abc', timeoutMs = 0): Promise<string> {
   const c = docker.getContainer(inst.containerName);
   const exec = await execCreate(c, { Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: user });
   const stream = await exec.start({ hijack: true, stdin: false });
   return await new Promise<string>((resolve, reject) => {
+    let ended = false;
+    const timer = timeoutMs ? setTimeout(() => { stream.destroy(); reject(new Error('命令结果未知：执行超时')); }, timeoutMs) : undefined;
+    stream.on('close', () => {
+      if (timer && !ended) clearTimeout(timer);
+      if (timeoutMs && !ended) reject(new Error('命令结果未知：连接关闭'));
+    });
     let out = '';
     let err = '';
     // Docker may split a UTF-8 filename across frames; decode after reassembly.
@@ -512,20 +519,27 @@ async function execCapture(inst: Instance, cmd: string[], user = 'abc'): Promise
     const stderr = { write: (b: Buffer) => { err += errDecoder.write(b); } } as any;
     docker.modem.demuxStream(stream, stdout, stderr);
     stream.on('end', async () => {
+      ended = true;
       out += outDecoder.end();
       err += errDecoder.end();
       try {
         const info = await exec.inspect();
+        if (timer) clearTimeout(timer);
+        if (timeoutMs && (info.Running || info.ExitCode == null)) {
+          reject(new Error('命令结果未知：无法确认执行已结束'));
+          return;
+        }
         if (info.ExitCode && info.ExitCode !== 0) {
           reject(new Error((err || out || `命令执行失败，退出码 ${info.ExitCode}`).trim()));
           return;
         }
         resolve(out || err);
       } catch (e) {
+        if (timer) clearTimeout(timer);
         reject(e);
       }
     });
-    stream.on('error', reject);
+    stream.on('error', e => { if (timer) clearTimeout(timer); reject(e); });
   });
 }
 
@@ -859,6 +873,45 @@ export async function snapshotContainerLog(inst: Instance, reason: string): Prom
   }
 }
 
+// Read only: explicit browser copy retrieves PNG without changing X11 ownership.
+export async function readClipboardImage(inst: Instance): Promise<Buffer> {
+  requireSupportedApp(inst);
+  const script = `set -euo pipefail
+export DISPLAY="\${DISPLAY:-:1}"
+timeout 5 xclip -selection clipboard -t image/png -o 2>/dev/null | head -c 67108865 | base64 -w0`;
+  let encoded: string;
+  try { encoded = await execCapture(inst, ['bash', '-c', script], 'abc', 10000); }
+  catch { throw new PasteError('微信剪贴板中没有可读取的 PNG 图片，请先在微信内复制图片', 422); }
+  const content = Buffer.from(encoded.trim(), 'base64');
+  validatePasteImage('image/png', content);
+  return content;
+}
+
+// Image API never retries a possibly dispatched Ctrl+V.
+export async function pasteImageInInstance(inst: Instance, mime: string, content: Buffer): Promise<void> {
+  requireSupportedApp(inst);
+  validatePasteImage(mime, content);
+  return withInstanceInput(inst.containerName, async () => {
+    let dir = '';
+    try {
+      dir = (await execCapture(inst, ['mktemp', '-d', '/tmp/woc-paste-XXXXXXXXXXXX'], 'abc', 10000)).trim();
+      if (!/^\/tmp\/woc-paste-[A-Za-z0-9]{12}$/.test(dir)) throw new Error('无法创建粘贴临时目录');
+      await docker.getContainer(inst.containerName).putArchive(tarSingleFile('image', content), { path: dir });
+    } catch {
+      if (dir && /^\/tmp\/woc-paste-[A-Za-z0-9]{12}$/.test(dir)) await execCapture(inst, ['rm', '-rf', '--', dir], 'abc', 5000).catch(() => {});
+      throw new PasteError('图片准备失败，可改用上传为文件', 502);
+    }
+    try {
+      await execCapture(inst, ['bash', '-c', IMAGE_PASTE_SCRIPT, 'woc-image-paste', mime, dir + '/image'], 'abc', 55000);
+    } catch {
+      throw new PasteError('图片粘贴结果未知，请检查输入框；不会自动重试，可改用上传为文件', 502, 'unknown');
+    } finally {
+      await execCapture(inst, ['rm', '-f', '--', dir + '/image'], 'abc', 5000).catch(() => {});
+      await execCapture(inst, ['rmdir', '--', dir], 'abc', 5000).catch(() => {});
+    }
+  });
+}
+
 // 通过 xdotool 在实例容器内输入文字（绕过 VNC keysym 限制，解决中文 IME 吞字问题）。
 // 用 base64 传递文本避免 shell 转义问题，xclip 写入剪贴板后 xdotool 模拟 Ctrl+V 粘贴。
 export async function typeInInstance(inst: Instance, text: string): Promise<void> {
@@ -875,14 +928,14 @@ export async function typeInInstance(inst: Instance, text: string): Promise<void
     `echo '${b64}' | base64 -d | xclip -selection clipboard -i >/dev/null 2>&1`,
     'xdotool key --clearmodifiers ctrl+v',
   ].join('; ');
-  await execCapture(inst, ['bash', '-c', cmd]);
+  await withInstanceInput(inst.containerName, () => execCapture(inst, ['bash', '-c', cmd]));
 }
 
 // 通过 xdotool 在实例容器内模拟一次按键（如 Return / BackSpace）。
 // 用于「无感输入」模式：中文经 xclip 转发期间，把被截下的回车/退格按序送出，保证顺序、避免抢跑。
 // key 仅允许字母与下划线（xdotool keysym 名），杜绝注入。
 export async function keyInInstance(inst: Instance, key: string): Promise<void> {
-  if (!/^[A-Za-z_]{1,20}$/.test(key)) throw new Error('按键名不合法');
+  if (key !== 'ctrl+v' && !/^[A-Za-z_]{1,20}$/.test(key)) throw new Error('按键名不合法');
   const cmd = [
     'set -e',
     'display="${DISPLAY:-}"',
@@ -891,7 +944,7 @@ export async function keyInInstance(inst: Instance, key: string): Promise<void> 
     'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
     `xdotool key --clearmodifiers ${key}`,
   ].join('; ');
-  await execCapture(inst, ['bash', '-c', cmd]);
+  await withInstanceInput(inst.containerName, () => execCapture(inst, ['bash', '-c', cmd]));
 }
 
 // ---------- 数据卷管理（仅管理员；路由层用 requireAdmin 限制） ----------

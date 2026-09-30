@@ -226,6 +226,27 @@ export const api = {
     if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || '上传失败');
     return res.json();
   },
+  clipboardImage: async (id: string): Promise<Blob> => {
+    const res = await apiFetch(`/api/instances/${id}/clipboard-image`, {
+      credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '读取微信图片失败');
+    if (!res.headers.get('content-type')?.startsWith('image/png')) throw new Error('图片响应无效，请检查登录状态');
+    return res.blob();
+  },
+  pasteImage: async (id: string, file: File) => {
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => abort.abort(), 70000);
+    try {
+      const res = await apiFetch(`/api/instances/${id}/paste-image?type=${encodeURIComponent(file.type)}`, {
+        method: 'POST', credentials: 'same-origin', signal: abort.signal,
+        headers: { 'content-type': 'application/octet-stream' }, body: file,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.outcome !== 'dispatched') throw new Error(data.error || '粘贴结果未知，请检查输入框；不会自动重试');
+      return data;
+    } finally { window.clearTimeout(timer); }
+  },
   downloadFileUrl: (id: string, name: string) => `/api/instances/${id}/download?name=${encodeURIComponent(name)}`,
   deleteFile: (id: string, name: string) => req(`/api/instances/${id}/files?name=${encodeURIComponent(name)}`, { method: 'DELETE' }),
 

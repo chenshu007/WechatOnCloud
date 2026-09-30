@@ -42,9 +42,69 @@ EOF
   mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
 }
 
+# Read the kernel's lock table; never take/unlink the install lock in a status query.
+# 0 = held, 1 = absent, 2 = cannot prove. Inherited child locks also count as active.
+installer_lock_state() {
+  [ -r /proc/locks ] || return 2
+  local info dev inode major minor key
+  [ -e "$STATE_DIR/.install.flock" ] || return 1
+  info="$(stat -Lc '%d %i' "$STATE_DIR/.install.flock" 2>/dev/null)" || return 2
+  read -r dev inode <<< "$info"
+  case "$dev:$inode" in *[!0-9:]*|:) return 2 ;; esac
+  major=$(( ((dev >> 8) & 4095) | ((dev >> 32) & 4294963200) ))
+  minor=$(( (dev & 255) | ((dev >> 12) & 4294967040) ))
+  printf -v key '%x:%x:%s' "$major" "$minor" "$inode"
+  awk -v key="$key" '
+    function norm(k, a) { split(k,a,":"); sub(/^0+/,"",a[1]); sub(/^0+/,"",a[2]); return (a[1]==""?"0":a[1]) ":" (a[2]==""?"0":a[2]) ":" a[3] }
+    $2 == "FLOCK" && norm($6) == key { found=1 }
+    END { exit !found }
+  ' /proc/locks
+}
+
+curl_failure_reason() {
+  case "$1" in
+    5) echo "代理域名解析失败（DNS）" ;;
+    6) echo "下载域名解析失败（DNS）" ;;
+    7) echo "无法建立网络连接" ;;
+    18|56) echo "下载传输中断" ;;
+    22) echo "下载服务器返回 HTTP 错误" ;;
+    23) echo "本地写入失败" ;;
+    28) echo "请求超时（连接或下载阶段）" ;;
+    33|36) echo "服务器无法继续断点续传" ;;
+    35) echo "TLS 握手失败" ;;
+    60) echo "TLS 证书验证失败" ;;
+    *) echo "下载失败（curl $1）" ;;
+  esac
+}
+
+# Only pre-transfer failures qualify. A timeout after connecting is not proof
+# of an unreachable server. Never shortcut an existing/increased partial file.
+pretransfer_failure() {
+  [ "$2" -eq 0 ] && [ "$3" -eq 0 ] || return 1
+  case "$1" in
+    5|6|7|35|60) return 0 ;;
+    28) [ "$4" = "000" ] && [ "$5" = "0.000000" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 print_status() {
   if [ -f "$STATUS_FILE" ]; then
-    cat "$STATUS_FILE"
+    local snapshot lock_state
+    snapshot="$(cat "$STATUS_FILE")"
+    if printf '%s' "$snapshot" | grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(busy|downloading|extracting|installing)"'; then
+      installer_lock_state; lock_state=$?
+      # Recheck snapshot and lock to avoid declaring a newly started install stale.
+      if [ "$lock_state" -eq 1 ] && [ "$snapshot" = "$(cat "$STATUS_FILE")" ]; then
+        installer_lock_state; lock_state=$?
+        if [ "$lock_state" -eq 1 ]; then
+          local installed=false; is_installed && installed=true
+          printf '{"phase":"error","percent":0,"installed":%s,"version":"%s","message":"上次安装已中断，请重新点击安装或更新以重试","updatedAt":%s}\n' "$installed" "$(cur_version)" "$(date +%s)"
+          return
+        fi
+      fi
+    fi
+    printf '%s\n' "$snapshot"
   elif is_installed; then
     echo "{\"phase\":\"done\",\"percent\":100,\"installed\":true,\"version\":\"$(cur_version)\",\"message\":\"已安装\",\"updatedAt\":$(date +%s)}"
   else
@@ -56,6 +116,7 @@ log() { echo "[$(date '+%F %T')] $*" >> "$STATE_DIR/install.log" 2>/dev/null; }
 
 do_install() (
   local file tmp pid total cur pct rc=1 attempt=0
+  local before http_code connect_time metrics unreachable main_reason fallback_reason failed_pretransfer
   file="$(deb_filename)"
   if [ -z "$file" ]; then
     write_status error 0 "不支持的架构：微信仅提供 x86_64 / arm64"
@@ -106,6 +167,7 @@ do_install() (
   # 关键：绝不在重试前删 $tmp —— 保留部分文件才能续传。
   while [ "$attempt" -lt 6 ]; do
     attempt=$((attempt+1))
+    failed_pretransfer=0
     for base in "$CDN_MAIN" "$CDN_FALLBACK"; do
       # Keep each mirror's partial download separate. A fallback must not append
       # bytes from a different CDN/version to the first mirror's partial file.
@@ -115,9 +177,12 @@ do_install() (
         rm -f "$tmp"
         printf '%s' "$base/$file" > "$tmp.url"
       fi
+      before="$(stat -c%s "$tmp" 2>/dev/null || echo 0)"
+      metrics="$tmp.metrics"
       curl -fSL -C - --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
            --max-time 600 --speed-time 60 --speed-limit 1024 \
-           -A "$UA" -o "$tmp" "$base/$file" & pid=$!
+           --write-out '%{http_code} %{time_connect}\n' \
+           -A "$UA" -o "$tmp" "$base/$file" > "$metrics" & pid=$!
       while kill -0 "$pid" 2>/dev/null; do
         if [ "${total:-0}" -gt 0 ] 2>/dev/null; then
           cur="$(stat -c%s "$tmp" 2>/dev/null || echo 0)"
@@ -129,7 +194,16 @@ do_install() (
         sleep 1
       done
       wait "$pid"; rc=$?
+      http_code=""; connect_time=""
+      read -r http_code connect_time < "$metrics" || true
+      rm -f "$metrics"
       [ "$rc" -eq 0 ] && break 2
+      cur="$(stat -c%s "$tmp" 2>/dev/null || echo 0)"
+      if pretransfer_failure "$rc" "$before" "$cur" "$http_code" "$connect_time"; then
+        failed_pretransfer=$((failed_pretransfer+1))
+      fi
+      if [ "$base" = "$CDN_MAIN" ]; then main_reason="$(curl_failure_reason "$rc")";
+      else fallback_reason="$(curl_failure_reason "$rc")"; fi
       log "curl 退出码 ${rc}（attempt=${attempt}），已下 $(stat -c%s "$tmp" 2>/dev/null || echo 0) 字节"
       # Local write failures should stop immediately, not spend six rounds retrying.
       [ "$rc" -eq 23 ] && break 2
@@ -137,6 +211,11 @@ do_install() (
       # against an unresumable partial file. Ordinary network errors retain it.
       if [ "$rc" -eq 33 ] || [ "$rc" -eq 36 ]; then rm -f "$tmp"; fi
     done
+    if [ "$attempt" -eq 1 ] && [ "$failed_pretransfer" -eq 2 ]; then
+      log "两个下载地址均未开始传输，停止外层重试：主地址 ${main_reason}；备用地址 ${fallback_reason}"
+      write_status error 0 "两个微信下载地址均不可用：主地址 ${main_reason}；备用地址 ${fallback_reason}。请检查 NAS 的 DNS、网络、代理或证书后重试"
+      return 1
+    fi
     write_status downloading -1 "下载中断，正在续传重试（$attempt/6）"
     sleep 2
   done
@@ -150,7 +229,7 @@ do_install() (
       write_status error 0 "磁盘空间不足，下载无法写入。请在宿主清理磁盘/旧镜像（docker image prune）后重试"
       return
     fi
-    write_status error 0 "下载失败（多次续传仍未完成，请检查网络/镜像后重试）"
+    write_status error 0 "$(curl_failure_reason "$rc")；多次续传仍未完成，已有下载片段保留，请检查网络后重试"
     return
   fi
 

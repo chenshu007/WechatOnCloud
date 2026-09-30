@@ -1,3 +1,4 @@
+import { MAX_PASTE_IMAGE_BYTES, PasteError, validatePasteImage } from './image-paste.js';
 import { createLoginRateLimiter } from './login-rate-limit.js';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
@@ -53,6 +54,8 @@ import {
   deleteInstanceFile,
   instanceLogs,
   buildDiagnostics,
+  pasteImageInInstance,
+  readClipboardImage,
   typeInInstance,
   keyInInstance,
   listOrphanVolumes,
@@ -782,6 +785,39 @@ app.post('/api/instances/:id/type', async (req, reply) => {
     return { ok: true };
   } catch (e: any) {
     return reply.code(500).send({ error: e?.message || '输入失败' });
+  }
+});
+
+app.get('/api/instances/:id/clipboard-image', async (req, reply) => {
+  reply.header('Cache-Control', 'no-store, max-age=0');
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  try { return reply.type('image/png').send(await readClipboardImage(inst)); }
+  catch (e) {
+    return reply.type('application/json').code(e instanceof PasteError ? e.statusCode : 502)
+      .send({ error: e instanceof PasteError ? e.message : '读取微信图片失败' });
+  }
+});
+
+app.post('/api/instances/:id/paste-image' , { bodyLimit: MAX_PASTE_IMAGE_BYTES }, async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例', outcome: 'not-started' });
+  const inst = findInstance(id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在', outcome: 'not-started' });
+  const mime = (req.query as any)?.type;
+  try {
+    validatePasteImage(mime, req.body);
+    await pasteImageInInstance(inst, mime, req.body);
+    return { ok: true, outcome: 'dispatched' };
+  } catch (e) {
+    if (e instanceof PasteError) return reply.code(e.statusCode).send({ error: e.message, outcome: e.outcome });
+    return reply.code(400).send({ error: '实例不支持图片粘贴', outcome: 'not-started' });
   }
 });
 

@@ -2511,3 +2511,21 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Clipboard tools share the existing floating desktop panel. */
+.clip-panel, .clip-image-entry, .clip-image-fallback { display: flex; flex-direction: column; gap: 10px; }
+.clip-image-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.clip-image-actions .btn { min-width: 0; padding: 10px 8px; font-size: 13px; }
+.clip-image-entry { padding-top: 4px; }
+.clip-image-box {
+  min-height: 76px; box-sizing: border-box; padding: 14px;
+  border: 1px dashed rgba(var(--shadow) / 0.3); border-radius: var(--r-small);
+  background: var(--trough); color: var(--text); font-size: 13px; outline: none; cursor: text;
+}
+.clip-image-box:empty::before { content: attr(data-placeholder); color: var(--muted); pointer-events: none; }
+.clip-image-box:focus { border-color: var(--wx-green); box-shadow: 0 0 0 2px rgba(var(--green-rgb) / 0.15); }
+.clip-secondary { align-self: flex-start; }
+.clip-image-fallback { border-top: 1px solid rgba(var(--shadow) / 0.15); padding-top: 12px; }
+
+
+.iv-clipboard { overflow-y: auto; box-sizing: border-box; }

@@ -1,3 +1,4 @@
+import { request as httpRequest } from 'node:http';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -60,5 +61,21 @@ test('real HTTP: successful login/session works, shared IP budget persists, and 
     assert.equal((await login('fresh-name')).status, 429);
     assert.equal((await fetch(url + '/api/auth/me', { headers: { cookie } })).status, 200);
     assert.equal((await fetch(url + '/api/auth/logout', { method: 'POST', headers: { cookie } })).status, 200);
+  });
+});
+
+test('image API rejects unauthenticated and missing-instance requests before Docker', { timeout: 20000 }, async () => {
+  await withPanel(async (login, url) => {
+    const path = '/api/instances/missing/paste-image?type=image/png';
+    const request = (cookie = '') => fetch(url + path, { method: 'POST', headers: {'content-type':'application/octet-stream', cookie}, body: Buffer.from('not an image') });
+    assert.equal((await request()).status, 401);
+    const ok = await login('TestAdmin', 'isolated-test-password');
+    const cookie = ok.headers.get('set-cookie')!.split(';')[0];
+    assert.ok([403,404].includes((await request(cookie)).status));
+    const tooLarge = await new Promise<number>((resolve,reject) => {
+      const req=httpRequest(url+path,{method:'POST',headers:{'content-type':'application/octet-stream','content-length':String(64*1024*1024+1),cookie}},res=>{res.resume();resolve(res.statusCode!)});
+      req.on('error',reject);req.setTimeout(5000,()=>req.destroy(new Error('body limit timeout')));req.end();
+    });
+    assert.equal(tooLarge,413);
   });
 });

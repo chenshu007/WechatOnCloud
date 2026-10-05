@@ -163,11 +163,8 @@ export const api = {
   changePassword: (oldPassword: string, newPassword: string) =>
     req('/api/account/password', { method: 'POST', body: JSON.stringify({ oldPassword, newPassword }) }),
 
-  // 版本与更新检测
+  // 当前定制构建版本（面板自更新已禁用）
   getVersion: () => req<VersionInfo>('/api/version'),
-  checkUpdate: () => req<VersionInfo>('/api/admin/version/check', { method: 'POST' }),
-  // 一键更新面板自身：拉新镜像 + 派生 helper 容器重建 woc-panel（带回滚）。返回后面板会重启。
-  selfUpdatePanel: () => req<{ ok: boolean; target: string; message: string }>('/api/admin/version/self-update', { method: 'POST' }),
 
   // 实例桌面深色（与面板主题统一的那个开关）：读取当前态 + 设置（管理员，实时切换运行中实例）。
   getDesktopTheme: () => req<{ dark: boolean }>('/api/desktop-theme'),

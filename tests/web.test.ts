@@ -21,7 +21,7 @@ test('ordinary network failure never reloads or unregisters PWA', async () => {
 });
 test('empty POST sends no JSON content-type; JSON POST still declares it', async () => {
   globalThis.fetch = async (_url, init) => { assert.equal(new Headers(init?.headers).has('content-type'), false); assert.equal(init?.body, undefined); return Response.json({}); };
-  await api.selfUpdatePanel();
+  await api.instanceStop('test');
   globalThis.fetch = async (_url, init) => { assert.equal(new Headers(init?.headers).get('content-type'), 'application/json'); assert.ok(init?.body); return Response.json({}); };
   await api.createInstance('test', [], undefined, 'wechat');
 });

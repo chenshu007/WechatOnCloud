@@ -132,55 +132,12 @@ function DiagnosticsSection() {
   );
 }
 
-// 「关于」：显示真实构建版本号 + 检测新版（后台已每 6h 查 Docker Hub/GHCR；这里读缓存并可手动重查）。
+// 「关于」：保留当前定制版本信息；通过定制发布流程更新。
 function AboutSection({ isAdmin }: { isAdmin: boolean }) {
-  const { toast, confirm } = useUI();
   const [info, setInfo] = useState<VersionInfo | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [updating, setUpdating] = useState(false);
-
   useEffect(() => {
     api.getVersion().then(setInfo).catch(() => {});
   }, []);
-
-  // 一键更新面板：拉新镜像 + 派生 helper 容器重建 woc-panel（数据保留，带失败回滚）。
-  // 触发后面板会被重建、本连接短暂中断，约 20s 后自动刷新到新版本。
-  const selfUpdate = async () => {
-    const ok = await confirm({
-      title: info?.isDev ? '升级到正式版？' : '一键更新面板？',
-      body: `将拉取最新${info?.isDev ? '正式发布' : ''}镜像并重建面板容器（数据/登录保留），约十几秒、期间面板会短暂重启，完成后自动刷新。${info?.latest ? `\n目标版本：${info.latest}` : ''}`,
-      confirmText: info?.isDev ? '升级' : '更新',
-    });
-    if (!ok) return;
-    setUpdating(true);
-    try {
-      const r = await api.selfUpdatePanel();
-      toast(r.message || '已开始更新，面板将重启，请稍候…', 'ok');
-      window.setTimeout(() => window.location.reload(), 25000); // 等新面板起来后自动刷新
-    } catch (e: any) {
-      toast(e.message || '更新失败', 'error');
-      setUpdating(false);
-    }
-  };
-  // 是否开发版由后端 info.isDev 给出（非正式 vX.Y.Z）。开发版允许一键「升级到正式版」。
-
-  const check = async () => {
-    setChecking(true);
-    try {
-      const r = await api.checkUpdate();
-      setInfo(r);
-      const rel = /^v?\d+\.\d+\.\d+$/.test(r.current);
-      if (r.error) toast('检查失败：' + r.error, 'error');
-      else if (r.hasUpdate) toast(`发现新版本 ${r.latest}`, 'ok');
-      else if (!rel) toast(`最新发布 ${r.latest ?? '未知'}（当前为开发版）`, 'ok');
-      else toast('已是最新版本', 'ok');
-    } catch (e: any) {
-      toast(e.message || '检查失败', 'error');
-    } finally {
-      setChecking(false);
-    }
-  };
-
   return (
     <>
       <div className="section-row" style={{ marginTop: 22 }}>
@@ -188,54 +145,14 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
       </div>
       <div className="settings-block">
         <div className="s-title-row">
-          <span className="s-app">云微 · WechatOnCloud</span>
-          {info?.isDev ? <span className="tag">开发版</span> : info?.hasUpdate ? <span className="tag tag-warn">有新版</span> : null}
+          <span className="s-app">云微 · WechatOnCloud · no-Chromium</span>
+          {info?.isDev && <span className="tag">开发版</span>}
         </div>
-        <p className="s-line">
-          当前版本 <b>{info?.current ?? '…'}</b>
-          {info?.latest && !info.error && (info.isDev || info.hasUpdate) && (
-            <>
-              {' · '}最新{info.isDev ? '发布' : ''} <b>{info.latest}</b>
-            </>
-          )}
-          {info && !info.isDev && !info.hasUpdate && info.latest && !info.error && <>{' · '}已是最新</>}
-        </p>
-        {info?.hasUpdate && (
-          <div className="ver-hint">
-            {!isAdmin
-              ? '面板有新版本，请联系管理员更新。'
-              : info.isDev
-                ? '当前为开发版（本地 / 自构建）。点「升级到正式版」即可拉取最新正式发布镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。'
-                : '点「一键更新面板」即可自动拉新镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。各实例镜像可在「管理 → 升级」单独更新。'}
-          </div>
-        )}
+        <p className="s-line">当前版本 <b>{info?.current ?? '…'}</b></p>
+        <p className="s-desc">面板自更新已禁用；请通过定制发布流程更新。</p>
         <div className="settings-actions">
-          {info?.hasUpdate && isAdmin && (
-            <button className="btn btn-primary s-btn" disabled={updating} onClick={selfUpdate}>
-              {updating ? '更新中…请稍候' : info.isDev ? '升级到正式版' : '一键更新面板'}
-            </button>
-          )}
-          {info?.hasUpdate && (
-            <a className="btn-text" href={RELEASES_URL + '/latest'} target="_blank" rel="noreferrer">
-              查看新版 ›
-            </a>
-          )}
-          {isAdmin && (
-            <button className="btn-text" disabled={checking || updating} onClick={check}>
-              {checking ? '检查中…' : '检查更新'}
-            </button>
-          )}
-          <a className="btn-text" href={RELEASES_URL} target="_blank" rel="noreferrer">
-            发布日志 ›
-          </a>
+          <a className="btn-text" href={RELEASES_URL} target="_blank" rel="noreferrer">发布日志 ›</a>
         </div>
-        {info && (
-          <p className="s-foot">
-            {info.checkedAt ? `上次检查 ${fmtDate(info.checkedAt)}` : '尚未检查'}
-            {info.source && ` · 来源 ${info.source}`}
-            {info.error && ` · ${info.error}`}
-          </p>
-        )}
       </div>
     </>
   );

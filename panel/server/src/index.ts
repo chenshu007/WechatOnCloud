@@ -91,7 +91,7 @@ import {
 import { createSession, getSession, destroySession, destroyUserSessions, SESSION_TTL_MS } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 import { BUILD_REVISION, CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
-import { triggerSelfUpdate } from './self-update.js';
+import { UPDATE_MESSAGE } from './self-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 import { createVncRejectLimiter, type VncRejectReason } from './vnc-reject.js';
 
@@ -223,17 +223,10 @@ app.post('/api/admin/version/check', async (req, reply) => {
   return await checkForUpdate();
 });
 
-// 一键更新面板自身（管理员）：拉新镜像 → 派生 helper 容器重建 woc-panel（带健康检查 + 失败回滚）。
-// 返回后面板会在十几秒内被 helper 重启，前端提示用户稍候刷新。
+// 定制面板禁止切换到普通发布镜像；旧客户端调用也明确拒绝。
 app.post('/api/admin/version/self-update', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
-  try {
-    const { target } = await triggerSelfUpdate();
-    return { ok: true, target, message: '已开始更新：面板将在十几秒内重启为新版本，请稍候刷新页面' };
-  } catch (e: any) {
-    appendPanelLog('ERROR', `面板自更新失败：${e?.message || e}`);
-    return reply.code(500).send({ error: '更新失败：' + (e?.message || e) });
-  }
+  return reply.code(409).send({ error: UPDATE_MESSAGE });
 });
 
 // ---------- 自助改密 ----------

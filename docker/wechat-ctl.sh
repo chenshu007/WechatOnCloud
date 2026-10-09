@@ -115,7 +115,7 @@ print_status() {
 log() { echo "[$(date '+%F %T')] $*" >> "$STATE_DIR/install.log" 2>/dev/null; }
 
 do_install() (
-  local file tmp pid total cur pct rc=1 attempt=0
+  local file tmp pid total cur pct rc=1 attempt=0 unreachable_rounds=0
   local before http_code connect_time metrics unreachable main_reason fallback_reason failed_pretransfer
   file="$(deb_filename)"
   if [ -z "$file" ]; then
@@ -163,7 +163,9 @@ do_install() (
 
   write_status downloading 0 "正在下载微信安装包"
   # 断点续传下载（-C -）：网络半路中断/被中间设备掐断时，下次从已下字节【继续】而非从 0 重来
-  #（这正是"反复卡在同一百分比退出"的解药）。--retry-all-errors 对传输中断也重试；外层再多轮兜底。
+  #（这正是"反复卡在同一百分比退出"的解药）。不用 curl 自带的 --retry：它重试前会把本次已下的部分截掉、从本次起点
+  # 重下（实测进度从 35% 掉回 0%，重试请求不带 Range）。中断 / 60 秒无进度一律交给外层循环，按已下字节续传，
+  # 并在主备地址间轮换（移植自上游 a18c706）。
   # 关键：绝不在重试前删 $tmp —— 保留部分文件才能续传。
   while [ "$attempt" -lt 6 ]; do
     attempt=$((attempt+1))
@@ -179,7 +181,7 @@ do_install() (
       fi
       before="$(stat -c%s "$tmp" 2>/dev/null || echo 0)"
       metrics="$tmp.metrics"
-      curl -fSL -C - --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 \
+      curl -fSL -C - --connect-timeout 20 \
            --max-time 600 --speed-time 60 --speed-limit 1024 \
            --write-out '%{http_code} %{time_connect}\n' \
            -A "$UA" -o "$tmp" "$base/$file" > "$metrics" & pid=$!
@@ -211,7 +213,10 @@ do_install() (
       # against an unresumable partial file. Ordinary network errors retain it.
       if [ "$rc" -eq 33 ] || [ "$rc" -eq 36 ]; then rm -f "$tmp"; fi
     done
-    if [ "$attempt" -eq 1 ] && [ "$failed_pretransfer" -eq 2 ]; then
+    # 两个地址都一个字节没拿到（DNS / 连接 / TLS 失败）且连续两轮如此才快速失败：没有 curl 自带重试兜底后，
+    # 只看一轮会把一次偶发抖动当成连不上。
+    if [ "$failed_pretransfer" -eq 2 ]; then unreachable_rounds=$((unreachable_rounds+1)); else unreachable_rounds=0; fi
+    if [ "$unreachable_rounds" -ge 2 ]; then
       log "两个下载地址均未开始传输，停止外层重试：主地址 ${main_reason}；备用地址 ${fallback_reason}"
       write_status error 0 "两个微信下载地址均不可用：主地址 ${main_reason}；备用地址 ${fallback_reason}。请检查 NAS 的 DNS、网络、代理或证书后重试"
       return 1

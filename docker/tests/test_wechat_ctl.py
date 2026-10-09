@@ -51,6 +51,11 @@ elif tool == 'curl':
             with dest.open('ab') as f: f.write(b'x' * 10)
             sys.exit(56)
         if scenario == 'connected-timeout': print('000 0.050000'); sys.exit(28)
+        if scenario == 'blip':
+            calls = root/'blip-calls'
+            n = int(calls.read_text()) if calls.exists() else 0
+            calls.write_text(str(n + 1))
+            if n < 2: print('000 0.000000'); sys.exit(7)
         if scenario == 'range-reset' and prior: sys.exit(33)
         if scenario == 'slow-download':
             (root/'started').write_text('yes')
@@ -171,16 +176,29 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.old_bin.read_text(), 'test-old')
         self.assertFalse(any(e['tool'] == 'pkill' for e in self.events()))
 
-    def test_both_mirrors_fail_before_transfer_stop_after_first_round(self):
+    def test_both_mirrors_fail_before_transfer_stop_after_second_round(self):
         for code in [5, 6, 7, 28, 35, 60]:
             with self.subTest(code=code):
                 trace = self.root / 'trace.jsonl'
                 if trace.exists(): trace.unlink()
                 result = self.run_install('unreachable-' + str(code))
                 self.assertEqual(result.returncode, 1)
-                self.assertEqual(len(self.events()), 2)
+                self.assertEqual(len(self.events()), 4)
                 self.assertIn('两个微信下载地址均不可用', self.status()['message'])
                 self.assertEqual(self.old_bin.read_text(), 'test-old')
+
+    def test_one_unreachable_round_is_not_fatal(self):
+        result = self.run_install('blip')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([e for e in self.events() if e['tool'] == 'curl']), 3)
+        self.assertEqual(self.status()['phase'], 'done')
+
+    def test_curl_never_uses_its_own_retry(self):
+        self.run_install('resume')
+        calls = [e for e in self.events() if e['tool'] == 'curl']
+        self.assertTrue(calls)
+        self.assertFalse(any(a.startswith('--retry') for e in calls for a in e['args']))
+        self.assertTrue(all('--speed-time' in e['args'] for e in calls))
 
     def test_partial_on_one_mirror_never_classifies_both_as_unreachable(self):
         self.run_install('mixed-network')

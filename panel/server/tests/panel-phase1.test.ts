@@ -79,7 +79,12 @@ test('Docker transfer integration: NUL argv and UTF-8 split across Docker frames
   let command: string[] = [];
   let archive: Buffer | undefined;
   t.mock.method(Docker.prototype, 'getContainer', () => ({
-    putArchive: async (data: Buffer) => { archive = data; },
+    putArchive: async (data: Buffer | NodeJS.ReadableStream) => {
+      if (Buffer.isBuffer(data)) { archive = data; return; }
+      const parts: Buffer[] = [];
+      for await (const c of data as AsyncIterable<Buffer>) parts.push(Buffer.from(c));
+      archive = Buffer.concat(parts);
+    },
     exec: async (opts: any) => {
       command = opts.Cmd;
       const isFind = command[0] === 'find';
@@ -102,9 +107,10 @@ test('Docker transfer integration: NUL argv and UTF-8 split across Docker frames
   const instance = { containerName: 'isolated-test' } as any;
   assert.deepEqual(await listInstanceFiles(instance), [{ name, size: 7, mtime: 123.5 }]);
   assert.deepEqual(command, ['find', '/config/Desktop', '-maxdepth', '1', '-type', 'f', '-printf', '%f\\0%s\\0%T@\\0']);
-  await uploadToInstance(instance, name, Buffer.from('payload'));
+  await uploadToInstance(instance, name, 7, (async function* () { yield Buffer.from('payload'); })());
   assert.ok(archive);
   assert.ok(parseInt(archive.subarray(136, 147).toString(), 8) > 1700000000);
+  assert.ok(archive.includes(Buffer.from('payload')));
 });
 
 function gateway() {

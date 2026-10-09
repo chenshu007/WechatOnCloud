@@ -28,6 +28,9 @@ services:
       - WOC_INSTANCE_MEM_SOFT_MB=${WOC_INSTANCE_MEM_SOFT_MB:-1500}
       - WOC_INSTANCE_MEM_HARD_MB=${WOC_INSTANCE_MEM_HARD_MB:-2500}
       - WOC_WATCHDOG_INTERVAL_SEC=${WOC_WATCHDOG_INTERVAL_SEC:-300}
+      - WOC_WATCHDOG_HEALTH_FAILS=${WOC_WATCHDOG_HEALTH_FAILS:-0}
+      # 桌面连接 / 页面反复无应答（KasmVNC 卡死）时自动重启实例；设 0 只断开并记日志、不自动重启
+      - WOC_STUCK_HEAL=${WOC_STUCK_HEAL:-1}
       # 设备伪装：os-release 伪装成 deepin（默认开，=0 关恢复 Debian）。详见 .env.example / doc/设备伪装.md。
       - WOC_SPOOF_OS=${WOC_SPOOF_OS:-1}
       # 登录会话时长（天，默认 30）。会话已落盘持久化：面板重启/自更新不再踢人。调小更安全、调大更省事。

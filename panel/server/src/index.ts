@@ -45,6 +45,7 @@ import {
   upgradeInstance,
   removeInstance as removeInstanceContainer,
   instanceRuntime,
+  instanceUptimeSec,
   triggerWechat,
   wechatStatus,
   instanceTarget,
@@ -94,6 +95,7 @@ import { BUILD_REVISION, CURRENT_VERSION, versionInfo, ensureChecked, checkForUp
 import { UPDATE_MESSAGE } from './self-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 import { createVncRejectLimiter, type VncRejectReason } from './vnc-reject.js';
+import { createStuckHealer } from './stuck-heal.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -1229,11 +1231,31 @@ function activeVncViewerCount(instId: string): number {
   return activeVncSockets.get(instId)?.size ?? 0;
 }
 
-proxy.on('proxyReq', (proxyReq, req) => {
+// KasmVNC 卡死识别 + 自愈（见 stuck-heal.ts）。WOC_STUCK_HEAL=0 只断开记日志、不自动重启。
+const stuckHealer = createStuckHealer({
+  enabled: process.env.WOC_STUCK_HEAL !== '0',
+  uptimeSec: async (id) => {
+    const inst = findInstance(id);
+    return inst ? instanceUptimeSec(inst) : null;
+  },
+  heal: async (id) => {
+    const inst = findInstance(id);
+    if (inst) await runInstance(inst, { keepImage: true }); // 自愈=重启：沿用当前镜像，绝不隐式换版
+  },
+  log: (id, msg, level) => {
+    appendInstanceLog(id, msg);
+    if (level) appendPanelLog(level, `实例 ${findInstance(id)?.name ?? id} ${msg}`);
+  },
+});
+
+proxy.on('proxyReq', (proxyReq, req, res) => {
   const auth = (req as any)._wocAuth;
   if (auth) proxyReq.setHeader('authorization', auth);
+  // 只盯 noVNC 页面本身：它出不来 = 实例服务卡住。其余资源 / 音频长轮询不计。
+  const instId = (req as any)._wocInstId;
+  if (instId && (req.url || '').startsWith('/vnc/index.html')) stuckHealer.watch(proxyReq, instId, '桌面页面', res);
 });
-proxy.on('proxyReqWs', (proxyReq, req) => {
+proxy.on('proxyReqWs', (proxyReq, req, socket) => {
   req.socket?.setKeepAlive(true, 30_000);
   proxyReq.on('socket', (upstreamSocket: Socket) => upstreamSocket.setKeepAlive(true, 30_000));
   const auth = (req as any)._wocAuth;
@@ -1246,6 +1268,10 @@ proxy.on('proxyReqWs', (proxyReq, req) => {
       trackActiveVncSocket(instId, req.socket as Socket);
       appendInstanceLog(instId, '[vnc] 上游已接受(101) · 桌面连接建立');
     });
+    // 只盯 VNC 连接本身（/websockify）；音频桥等其它 ws 不计
+    if ((req.url || '').startsWith('/websockify')) {
+      stuckHealer.watch(proxyReq, instId, '桌面连接（websocket 升级）', socket, () => socket.destroy());
+    }
   }
 });
 // 兜底：剥掉 KasmVNC 401 的 WWW-Authenticate 头，避免浏览器弹出原生 Basic Auth 登录框。
@@ -1322,6 +1348,7 @@ const desktopHandler = (req: FastifyRequest, reply: FastifyReply) => {
   reply.hijack();
   req.raw.url = parsed.rest;
   (req.raw as any)._wocAuth = basicAuth(inst);
+  (req.raw as any)._wocInstId = inst.id;
   proxy.web(req.raw, reply.raw, { target: instanceTarget(inst) });
 };
 

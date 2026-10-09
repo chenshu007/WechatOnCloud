@@ -233,6 +233,12 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     extensionErrorLogged.current = true;
     api.clientLog(id, '忽略浏览器扩展误报：VNC 仍连接，不重载');
   };
+  const reconnectGapLogged = useRef(false); // 断线重连空档的 lastActiveAt 报错：每次页面加载只记一条
+  const onReconnectGap = () => {
+    if (reconnectGapLogged.current || !id) return;
+    reconnectGapLogged.current = true;
+    api.clientLog(id, 'VNC 断线，noVNC 自带重连中（忽略重连空档的 lastActiveAt 报错，不整页重载）');
+  };
 
   const inst = instances.find((i) => i.id === id);
   const profile = appProfile(inst?.appType); // 按应用类型显示正确文案（微信/Telegram…）
@@ -585,7 +591,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     let lastState = '';
     const t = window.setInterval(() => {
       const doc = frameRef.current?.contentDocument;
-      const fatal = fatalErrorMsg(doc, onExtensionError);
+      const fatal = fatalErrorMsg(doc, onExtensionError, onReconnectGap);
       if (fatal) {
         recoverFromFatal(fatal);
         return;
@@ -623,7 +629,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!win) return;
     const onErr = () => {
       window.setTimeout(() => {
-        const msg = fatalErrorMsg(frameRef.current?.contentDocument, onExtensionError);
+        const msg = fatalErrorMsg(frameRef.current?.contentDocument, onExtensionError, onReconnectGap);
         if (msg) recoverFromFatal(msg);
       }, 400);
     };

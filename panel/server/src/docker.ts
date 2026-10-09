@@ -495,6 +495,18 @@ export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
   }
 }
 
+// 实例容器本次已运行多少秒（State.StartedAt 起算）；没在跑 / 读不到时返回 null。
+export async function instanceUptimeSec(inst: Instance): Promise<number | null> {
+  try {
+    const info = await docker.getContainer(inst.containerName).inspect();
+    if (!info.State?.Running) return null;
+    const t = Date.parse(String(info.State.StartedAt || ''));
+    return Number.isFinite(t) ? Math.max(0, (Date.now() - t) / 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
 // 创建 exec 实例。容器 init 未完成时，linuxserver 基镜像的 'abc' 用户可能还没建好，docker 会以
 // 400「unable to find user abc: no matching entries in passwd file」直接拒绝创建 exec（见 issue #74）。
 // 对这种"用户未就绪"错误短暂重试，给容器 init 一点时间；超时则抛清晰的中文错误，而非透传难懂的 docker 400。

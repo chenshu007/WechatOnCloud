@@ -201,7 +201,22 @@ async function ensureImage(): Promise<void> {
 }
 
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
-export async function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
+// 同一实例的重建串行执行（移植自上游 c968908）：手动重启、看门狗自愈、卡死自愈、升级可能撞在一起，
+// 并发时两边都「删旧建新」，实测同时点两次重启必有一次报「容器名已被占用」失败。
+const lifecycleChains = new Map<string, Promise<unknown>>();
+export function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
+  const run = (lifecycleChains.get(inst.id) || Promise.resolve()).then(
+    () => runInstanceNow(inst, opts),
+    () => runInstanceNow(inst, opts),
+  );
+  const tail = run.catch(() => undefined);
+  lifecycleChains.set(inst.id, tail);
+  void tail.then(() => {
+    if (lifecycleChains.get(inst.id) === tail) lifecycleChains.delete(inst.id);
+  });
+  return run;
+}
+async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
   requireSupportedApp(inst);
   const net = await ensureNetwork();
   const existing = docker.getContainer(inst.containerName);

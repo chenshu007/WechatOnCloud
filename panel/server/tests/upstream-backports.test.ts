@@ -77,6 +77,25 @@ test('failed removal never creates a conflicting replacement container', async (
   assert.ok(!fake.events.includes('create'));
 });
 
+test('concurrent rebuilds of one instance run one after another', async (t) => {
+  const fake = fakeDocker(t);
+  await Promise.all([runInstance(inst, { keepImage: true }), runInstance(inst, { keepImage: true })]);
+  const firstStart = fake.events.indexOf('start');
+  const secondInspect = fake.events.indexOf('inspect-container', fake.events.indexOf('inspect-container') + 1);
+  assert.equal(fake.events.filter((e) => e === 'start').length, 2);
+  assert.ok(firstStart < secondInspect, fake.events.join(','));
+});
+
+test('a failed rebuild does not block the next one', async (t) => {
+  const fake = fakeDocker(t, { imageError: new Error('image unavailable') });
+  await assert.rejects(runInstance(inst, { keepImage: true }), /image unavailable/);
+  t.mock.restoreAll();
+  const ok = fakeDocker(t);
+  await runInstance(inst, { keepImage: true });
+  assert.ok(ok.events.includes('start'));
+  assert.ok(!fake.events.includes('start'));
+});
+
 test('VNC rejection limiter permits distinct reasons and expires duplicates', () => {
   const allow = createVncRejectLimiter();
   assert.equal(allow('abc123', 'SESSION_INVALID', 0), true);

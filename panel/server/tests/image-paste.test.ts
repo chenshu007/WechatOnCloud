@@ -7,6 +7,8 @@ import { test } from 'node:test';
 import { PassThrough } from 'node:stream';
 import Docker from 'dockerode';
 import { validatePasteImage, withInstanceInput, IMAGE_PASTE_SCRIPT, PasteError } from '../src/image-paste.js';
+// 先松开 xdotool 自己可能按住的修饰键、再不带 --clearmodifiers 地按（上游 31c5146：粘图后下一条文字变成「v」）
+const RELEASE = 'keyup Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift';
 import { installImagePasteBridge } from '../../web/src/image-paste-bridge.ts';
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jV1kAAAAASUVORK5CYII=','base64');
 test('image MIME, signatures, size and unsupported formats are checked',()=>{
@@ -63,14 +65,14 @@ case " $* " in
  *" -o "*) cat "$TEST_ROOT/selection";;
 esac
 `,{mode:0o755});
-  writeFileSync(join(bin,'xdotool'),'#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_ROOT/keys"\n[ "${FAIL_KEY:-0}" != 1 ]\n',{mode:0o755});
+  writeFileSync(join(bin,'xdotool'),'#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_ROOT/keys"\n[ "$1" != key ] || [ "${FAIL_KEY:-0}" != 1 ]\n',{mode:0o755});
   for(const fail of ['0','1']){
    const dir=join(root,'request-'+fail);mkdirSync(dir);writeFileSync(join(dir,'image'),png);
    const r=spawnSync('bash',['-c',IMAGE_PASTE_SCRIPT,'test','image/png',join(dir,'image')],{env:{...process.env,PATH:bin+':'+process.env.PATH,TEST_ROOT:root,FAIL_KEY:fail}});
    assert.equal(r.status,Number(fail),r.stderr.toString());assert.equal(existsSync(dir),false);
   }
   assert.deepEqual(readFileSync(join(root,'selection')),png);
-  assert.deepEqual(readFileSync(join(root,'keys'),'utf8').trim().split('\n'),['key --clearmodifiers ctrl+v','key --clearmodifiers ctrl+v']);
+  assert.deepEqual(readFileSync(join(root,'keys'),'utf8').trim().split('\n'),[RELEASE,'key ctrl+v',RELEASE,'key ctrl+v']);
  }finally{rmSync(root,{recursive:true,force:true})}
 });
 

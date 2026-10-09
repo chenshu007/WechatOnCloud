@@ -1,5 +1,6 @@
 import { installImagePasteBridge } from '../image-paste-bridge';
-import { fatalErrorMsg } from '../vnc-errors';
+import { fatalErrorMsg, isExtensionErrorEvent } from '../vnc-errors';
+import { installSeamlessIme } from '../seamless-ime';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, appProfile } from '../api';
@@ -16,75 +17,6 @@ function desktopUrl(id: string) {
   );
 }
 
-// 「无感输入」钩子：装进同源 iframe，让用户直接在微信里打中文。
-// - compositionend（中文提交）→ 经 xclip+xdotool 转发（绕开 VNC keysym 容量上限）。
-// - 转发未完成期间（队列活跃），把后续可见字符 + 回车/退格也串进同一队列按序送出 →
-//   彻底消除"中文走异步、数字走 keysym 抢跑"导致的"你好123→23"丢字。
-// - 队列空闲时不干预：英文/数字仍走原生 keysym，零延迟。
-// 返回清理函数（切回转发模式 / 重连 / 卸载时移除监听）。
-function installSeamlessIme(win: Window, doc: Document, instId: string): () => void {
-  type Job = { kind: 'text'; data: string } | { kind: 'key'; data: string };
-  const queue: Job[] = [];
-  let draining = false;
-  const active = () => draining || queue.length > 0;
-
-  const drain = async () => {
-    if (draining) return;
-    draining = true;
-    while (queue.length) {
-      const job = queue[0];
-      try {
-        if (job.kind === 'text') await api.typeInInstance(instId, job.data);
-        else await api.keyInInstance(instId, job.data);
-      } catch {
-        /* 单条失败丢弃，继续后续，避免卡住队列 */
-      }
-      queue.shift();
-    }
-    draining = false;
-  };
-
-  const onCompositionEnd = (e: Event) => {
-    const txt = (e as CompositionEvent).data;
-    if (!txt) return;
-    queue.push({ kind: 'text', data: txt });
-    drain();
-  };
-
-  // 捕获阶段（iframe window 最外层）抢先拦截，赶在 noVNC 之前 → stopImmediatePropagation 阻止它发 keysym。
-  // 关键：队列活跃（有中文正在转发）时，只接管【数字】和回车/退格——它们不参与拼音合成、且是原"混数字丢字"的祸首；
-  // 字母绝不接管，否则会把下一个词的拼音首字母（如"呀"的 y）当成字面字符抢走，造成"你好y呀"。字母交给输入法合成。
-  const onKeyDownCapture = (ev: Event) => {
-    const e = ev as KeyboardEvent;
-    if (e.isComposing) return; // 拼音合成中，交给输入法（候选数字选词也在此放行）
-    if (e.ctrlKey || e.altKey || e.metaKey) return; // 快捷键放行
-    if (!active()) return; // 没有中文在转发 → 不接管（英文/数字走原生 keysym，零延迟）
-    if (/^[0-9]$/.test(e.key)) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      queue.push({ kind: 'text', data: e.key });
-      drain();
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      queue.push({ kind: 'key', data: 'Return' });
-      drain();
-    } else if (e.key === 'Backspace') {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      queue.push({ kind: 'key', data: 'BackSpace' });
-      drain();
-    }
-    // 其它非可见键（方向键/功能键等）放行
-  };
-
-  doc.addEventListener('compositionend', onCompositionEnd, true);
-  win.addEventListener('keydown', onKeyDownCapture, true);
-  return () => {
-    doc.removeEventListener('compositionend', onCompositionEnd, true);
-    win.removeEventListener('keydown', onKeyDownCapture, true);
-  };
-}
 
 interface TFile {
   name: string;
@@ -488,7 +420,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         /* ignore */
       }
     };
-  }, [showVnc, id, frameLoaded]);
+  }, [showVnc, id, frameLoaded, frameGeneration]);
 
   // 进入/重连桌面前，按输入模式设 KasmVNC 的 enable_ime（iframe 同源共享 localStorage，加载前设好即生效）。
   //   无感（seamless）：enable_ime=true，启用 noVNC 合成 textarea；中文 keysym 已被容器补丁抑制，
@@ -508,9 +440,17 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     const win = frameRef.current?.contentWindow;
     const doc = frameRef.current?.contentDocument;
     if (!win || !doc) return;
-    const cleanup = installSeamlessIme(win, doc, id);
+    let lastFail = 0;
+    const send = { text: (t: string) => api.typeInInstance(id, t), key: (k: string) => api.keyInInstance(id, k) };
+    const cleanup = installSeamlessIme(win, doc, send, (e) => {
+      if (Date.now() - lastFail < 5000) return; // 连续失败只提示一次
+      lastFail = Date.now();
+      toast(`刚输入的文字没有发出去：${e?.message || '网络或实例异常'}`, 'error');
+    });
     return cleanup;
-  }, [inputMode, showVnc, frameLoaded, id]);
+    // iframe 页内换文档（自动重连页 → noVNC）后必须重挂，否则监听留在已销毁的旧文档上，中文被吞、只剩英文能打（上游 0479b1b）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inputMode, showVnc, frameLoaded, frameGeneration, id]);
 
   // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
   // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
@@ -565,7 +505,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         /* ignore */
       }
     };
-  }, [showVnc, id, soundOn, frameLoaded]);
+  }, [showVnc, id, soundOn, frameLoaded, frameGeneration]);
 
   // 致命崩溃自愈：仅在 KasmVNC 真的弹出致命错误浮层时触发——整页重载是干净重连的唯一可靠路径
   // （旧 ws 已死，重载后干净重连；与 setMode/restartInstance 同理，不会引发新旧 ws 并存卡死 Xvnc）。
@@ -630,28 +570,34 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!showVnc || !frameLoaded || !id) return;
     const win = frameRef.current?.contentWindow;
     if (!win) return;
-    const onErr = () => {
+    const onErr = (ev: Event) => {
+      if (ev.type === 'error' && ev.target !== win) return; // 捕获阶段也会收到 img 等资源加载失败，与崩溃无关
+      if (isExtensionErrorEvent(ev, frameRef.current?.contentDocument)) {
+        ev.stopImmediatePropagation(); // 先于 KasmVNC 的全局处理器：扩展报错连浮层都不弹
+        onExtensionError();
+        return;
+      }
       window.setTimeout(() => {
         const msg = fatalErrorMsg(frameRef.current?.contentDocument, onExtensionError, onReconnectGap);
         if (msg) recoverFromFatal(msg);
       }, 400);
     };
     try {
-      win.addEventListener('error', onErr);
-      win.addEventListener('unhandledrejection', onErr);
+      win.addEventListener('error', onErr, true);
+      win.addEventListener('unhandledrejection', onErr, true);
     } catch {
       return;
     }
     return () => {
       try {
-        win.removeEventListener('error', onErr);
-        win.removeEventListener('unhandledrejection', onErr);
+        win.removeEventListener('error', onErr, true);
+        win.removeEventListener('unhandledrejection', onErr, true);
       } catch {
         /* ignore */
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showVnc, frameLoaded, id]);
+  }, [showVnc, frameLoaded, frameGeneration, id]);
 
   if (!id) {
     nav('/', { replace: true });

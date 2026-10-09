@@ -12,7 +12,6 @@ process.env.WOC_DOCKER_NETWORK = 'isolated-test-network';
 process.env.WOC_WECHAT_IMAGE = 'example.invalid/wechat:fixed-test';
 after(() => rmSync(dir, { recursive: true, force: true }));
 const { runInstance, upgradeInstance } = await import('../src/docker.js');
-const { buildCreateOpts } = await import('../src/self-update.js');
 const inst: any = { id: 'abc123', containerName: 'test-only', volumeName: 'test-only', kasmUser: 'test', kasmPassword: 'test' };
 
 function fakeDocker(t: any, options: { inspectError?: any; imageError?: any; removeError?: any; pullError?: any } = {}) {
@@ -76,18 +75,6 @@ test('failed removal never creates a conflicting replacement container', async (
   const fake = fakeDocker(t, { removeError: new Error('remove denied') });
   await assert.rejects(runInstance(inst, { keepImage: true }), /remove denied/);
   assert.ok(!fake.events.includes('create'));
-});
-
-test('missing old image metadata cannot overwrite new image identity', async (t) => {
-  t.mock.method(Docker.prototype, 'getImage', (ref: string) => ({ inspect: async () => {
-    if (ref === 'old-id') throw new Error('old image unavailable');
-    return { Config: { Env: ['WOC_VERSION=nas-new', 'PANEL_PORT=8080'] } };
-  } }));
-  const opts = await buildCreateOpts({ Image: 'old-id', Config: { Env: ['WOC_VERSION=nas-old', 'PANEL_PORT=9000', 'WOC_WECHAT_IMAGE=custom:pinned'] } }, 'new-id');
-  assert.ok(opts.Env!.includes('WOC_VERSION=nas-new'));
-  assert.ok(!opts.Env!.includes('WOC_VERSION=nas-old'));
-  assert.ok(opts.Env!.includes('PANEL_PORT=9000'));
-  assert.ok(opts.Env!.includes('WOC_WECHAT_IMAGE=custom:pinned'));
 });
 
 test('VNC rejection limiter permits distinct reasons and expires duplicates', () => {

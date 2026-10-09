@@ -42,23 +42,21 @@ EOF
   mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
 }
 
-# Read the kernel's lock table; never take/unlink the install lock in a status query.
-# 0 = held, 1 = absent, 2 = cannot prove. Inherited child locks also count as active.
+# Is an installer holding the install lock? Never take/unlink the lock in a status query.
+# 0 = held, 1 = absent, 2 = cannot prove. Inherited child fds share the lock and also count as active.
+# Inside containers on this NAS /proc/locks is empty and the device numbers it would use differ from
+# stat(2) on btrfs volumes, so look at the open files instead: any fd pointing at the lock file whose
+# /proc/<pid>/fdinfo carries a FLOCK line. Status and installer both run as abc, so their fds are readable.
 installer_lock_state() {
-  [ -r /proc/locks ] || return 2
-  local info dev inode major minor key
+  [ -d /proc/self/fd ] || return 2
+  local lock fd pid
   [ -e "$STATE_DIR/.install.flock" ] || return 1
-  info="$(stat -Lc '%d %i' "$STATE_DIR/.install.flock" 2>/dev/null)" || return 2
-  read -r dev inode <<< "$info"
-  case "$dev:$inode" in *[!0-9:]*|:) return 2 ;; esac
-  major=$(( ((dev >> 8) & 4095) | ((dev >> 32) & 4294963200) ))
-  minor=$(( (dev & 255) | ((dev >> 12) & 4294967040) ))
-  printf -v key '%x:%x:%s' "$major" "$minor" "$inode"
-  awk -v key="$key" '
-    function norm(k, a) { split(k,a,":"); sub(/^0+/,"",a[1]); sub(/^0+/,"",a[2]); return (a[1]==""?"0":a[1]) ":" (a[2]==""?"0":a[2]) ":" a[3] }
-    $2 == "FLOCK" && norm($6) == key { found=1 }
-    END { exit !found }
-  ' /proc/locks
+  lock="$(readlink -f "$STATE_DIR/.install.flock" 2>/dev/null)" || return 2
+  while IFS= read -r fd; do
+    pid="${fd#/proc/}"; pid="${pid%%/*}"
+    grep -q '^lock:.*FLOCK' "/proc/$pid/fdinfo/${fd##*/}" 2>/dev/null && return 0
+  done < <(find /proc/[0-9]*/fd -maxdepth 1 -lname "$lock" 2>/dev/null)
+  return 1
 }
 
 curl_failure_reason() {

@@ -822,18 +822,18 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
-  // 中文输入条发送：把本框文本经 xclip+xdotool 直接粘进微信当前聚焦的输入框（绕开 VNC IME）。
+  // 中文输入条发送：把本框文本经 xclip+xdotool 直接粘进微信当前会话的输入框（绕开 VNC IME）。
   // 在面板的真实 textarea 里用原生输入法打字，100% 可靠，不依赖 VNC 的 enable_ime / 合成事件。
+  // focusChat：服务端先把焦点锁到微信当前会话的输入框再粘贴，不用事先在微信里点好光标（其它应用忽略此项）。
   const sendImeText = async () => {
     const t = imeText;
     if (!t.trim() || !id) return;
     setImeSending(true);
     try {
-      await api.typeInInstance(id, t);
-      // 仅本页显式勾选后才补 Return；默认只填字。焦点始终留在本输入条。
+      // 仅本页显式勾选后才补 Return（与粘贴同一次执行）；默认只填字。焦点始终留在本输入条。
       // 切勿在转发模式把焦点切回虚拟机——那等于开了"无感输入"，用户接着打的拼音会以原始 keysym 直灌微信
       // 输入框（出现 "nniih'h你好啊" 这种串码）。下一条仍在本条用本机输入法安全地打。
-      if (autoEnter) await api.keyInInstance(id, 'Return');
+      await api.typeInInstance(id, t, { focusChat: true, send: autoEnter });
       setImeText('');
     } catch (e: any) {
       toast(e?.message || '发送失败：请确认实例已「升级实例」（镜像含 xclip/xdotool）', 'error');

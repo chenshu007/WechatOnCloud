@@ -1048,8 +1048,44 @@ export async function pasteImageInInstance(inst: Instance, mime: string, content
 export const XDO_RELEASE_MODS = 'xdotool keyup Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift';
 const xdoKey = (key: string) => `${XDO_RELEASE_MODS}\nxdotool key ${key}`;
 
-export async function typeInInstance(inst: Instance, text: string): Promise<void> {
+// 「锁定当前会话」：粘贴前先把焦点送进微信主窗口当前会话的输入框，不再依赖用户事先点好光标
+// （焦点停在搜索框、消息列表或别的窗口时，Ctrl+V 和回车都会落空）。
+// 主窗口 = class wechat、标题「微信」、尺寸像主窗口的最大那个（排除登录框、图片查看、小程序等）。
+// 输入框在会话区底部、高度固定：点「窗口底边上方 80px、可见右缘左侧 200px」（避开右下角「发送」按钮），
+// 再 Ctrl+End 把光标移到草稿末尾，粘贴内容总是追加在已有草稿之后。鼠标点完放回原处。
+// 找不到主窗口或输入框不在屏幕内就报错退出，不盲发。
+export const WECHAT_FOCUS_INPUT = [
+  'read -r sw sh <<<"$(xdotool getdisplaygeometry)"',
+  'best=0; main=""',
+  "for c in $(xdotool search --onlyvisible --class '^wechat$' 2>/dev/null); do",
+  '  case "$(xdotool getwindowname "$c" 2>/dev/null)" in 微信|Weixin|WeChat) ;; *) continue ;; esac',
+  "  eval \"$(xdotool getwindowgeometry --shell \"$c\" | grep -E '^(X|Y|WIDTH|HEIGHT)=-?[0-9]+$')\"",
+  '  [ "${WIDTH:-0}" -ge 600 ] && [ "${HEIGHT:-0}" -ge 400 ] || continue',
+  '  [ $((WIDTH * HEIGHT)) -gt "$best" ] || continue',
+  '  best=$((WIDTH * HEIGHT)); main=$c; mx=$X; my=$Y; mw=$WIDTH; mh=$HEIGHT',
+  'done',
+  '[ -n "$main" ] || { echo "未找到微信聊天窗口：请确认微信已登录、主窗口未最小化" >&2; exit 3; }',
+  'right=$((mx + mw)); [ "$right" -le "$sw" ] || right=$sw',
+  'cx=$((right - 200)); cy=$((my + mh - 80))',
+  'if [ "$cx" -lt $((mx + 400)) ] || [ "$cy" -lt 0 ] || [ "$cy" -ge "$sh" ]; then',
+  '  echo "微信输入框不在可视区域内：请把浏览器窗口放大后再发" >&2; exit 3',
+  'fi',
+  'eval "$(xdotool getmouselocation --shell | grep -E \'^(X|Y)=[0-9]+$\')"; ox=$X; oy=$Y',
+  'xdotool windowactivate --sync "$main" >/dev/null 2>&1 || true',
+  `${XDO_RELEASE_MODS}`,
+  'xdotool mousemove --sync "$cx" "$cy" click 1',
+  'xdotool key ctrl+End',
+  'xdotool mousemove "$ox" "$oy"',
+].join('\n');
+
+export interface TypeOptions {
+  focusChat?: boolean; // 先锁定到微信当前会话的输入框（见 WECHAT_FOCUS_INPUT），仅微信实例有效
+  send?: boolean; // 粘贴后回车发送（与粘贴同一次 exec，中间不会被别的输入插队）
+}
+
+export async function typeInInstance(inst: Instance, text: string, opts: TypeOptions = {}): Promise<void> {
   const b64 = Buffer.from(text, 'utf8').toString('base64');
+  const focus = opts.focusChat && instanceAppType(inst) === 'wechat';
   const cmd = [
     'set -e',
     'display="${DISPLAY:-}"',
@@ -1060,7 +1096,10 @@ export async function typeInInstance(inst: Instance, text: string): Promise<void
     // xclip -i 会 daemon 化常驻持有剪贴板选区，并继承 exec 的 stdout/stderr；不重定向的话 docker exec
     // 要等这俩 fd 关闭，实测每次卡 ~2s。重定向到 /dev/null 后台后，整条链路从 ~2.1s 降到 ~0.08s。
     `echo '${b64}' | base64 -d | xclip -selection clipboard -i >/dev/null 2>&1`,
+    ...(focus ? [WECHAT_FOCUS_INPUT] : []),
     xdoKey('ctrl+v'),
+    // 粘贴时应用要向 xclip 取剪贴板，稍等再回车，免得回车抢在文字上屏之前
+    ...(opts.send ? ['sleep 0.15', xdoKey('Return')] : []),
   ].join('\n');
   await withInstanceInput(inst.containerName, () => execCapture(inst, ['bash', '-c', cmd]));
 }

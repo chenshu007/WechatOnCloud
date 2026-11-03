@@ -798,10 +798,10 @@ app.post('/api/instances/:id/type', async (req, reply) => {
   if (!u) return;
   const id = (req.params as any).id;
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
-  const { text } = (req.body as any) ?? {};
+  const { text, focusChat, send } = (req.body as any) ?? {};
   if (!text || typeof text !== 'string' || text.length > 500) return reply.code(400).send({ error: '文字为空或过长' });
   try {
-    await typeInInstance(findInstance(id)!, text);
+    await typeInInstance(findInstance(id)!, text, { focusChat: focusChat === true, send: send === true });
     return { ok: true };
   } catch (e: any) {
     return reply.code(500).send({ error: e?.message || '输入失败' });

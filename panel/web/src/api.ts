@@ -343,7 +343,8 @@ export const api = {
   controlStatus: (id: string) => req<{ free: boolean; mine: boolean; holder: string | null }>(`/api/instances/${id}/control`),
   controlBeat: (id: string) => req<{ mine: boolean; holder: string }>(`/api/instances/${id}/control/beat`, { method: 'POST' }),
   controlTake: (id: string) => req<{ mine: boolean; holder: string }>(`/api/instances/${id}/control/take`, { method: 'POST' }),
-  typeInInstance: (id: string, text: string) => req(`/api/instances/${id}/type`, { method: 'POST', body: JSON.stringify({ text }) }),
+  typeInInstance: (id: string, text: string, opts: { focusChat?: boolean; send?: boolean } = {}) =>
+    req(`/api/instances/${id}/type`, { method: 'POST', body: JSON.stringify({ text, ...opts }) }),
   keyInInstance: (id: string, key: string) => req(`/api/instances/${id}/key`, { method: 'POST', body: JSON.stringify({ key }) }),
 
   // 桌面壁纸

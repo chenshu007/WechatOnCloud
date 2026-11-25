@@ -1006,19 +1006,21 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 13 tools with exact annotations, click/scroll, 
   };
 
   try {
-    // 1. tools/list returns exact 13 tools (7 read-only + woc_session_header + 5 write) with expected annotations
+    // 1. tools/list returns exact 14 tools (7 read-only + woc_session_header + 6 write) with expected annotations
     const list = await rpc(1, 'tools/list');
-    assert.equal(list.result.tools.length, 13);
+    assert.equal(list.result.tools.length, 14);
     const byName = new Map<string, any>(list.result.tools.map((t: any) => [t.name, t]));
     assert.equal(byName.get('woc_session_header').annotations.readOnlyHint, true);
     assert.equal(byName.get('woc_session_header').annotations.destructiveHint, false);
     assert.deepEqual(byName.get('woc_draft_reply').inputSchema.required, ['instance_id', 'text']);
     assert.ok(byName.get('woc_draft_reply').inputSchema.properties.expected_header_digest);
+    assert.deepEqual(byName.get('woc_draft_image').inputSchema.required, ['instance_id', 'image_base64', 'mime_type']);
+    assert.ok(byName.get('woc_draft_image').inputSchema.properties.expected_header_digest);
     for (const ro of MCP_TOOLS) {
       assert.equal(byName.get(ro.name).annotations.readOnlyHint, true);
       assert.equal(byName.get(ro.name).annotations.destructiveHint, false);
     }
-    for (const nonDest of ['woc_scroll', 'woc_draft_reply']) {
+    for (const nonDest of ['woc_scroll', 'woc_draft_reply', 'woc_draft_image']) {
       assert.equal(byName.get(nonDest).annotations.readOnlyHint, false);
       assert.equal(byName.get(nonDest).annotations.destructiveHint, false);
       assert.equal(byName.get(nonDest).annotations.idempotentHint, false);
@@ -1845,7 +1847,7 @@ test('MCP_EDITOR_MAX_DIFF_PIXELS parsing accepts only a bounded non-negative int
   for (const bad of ['-1', '4.5', 'abc', '1e3', '100001', '9999999']) assert.equal(parseEditorMaxDiffEnv(bad), 'invalid');
 });
 
-test('real panel boot: MCP_ALLOW_WRITE=1 exposes 13 tools including woc_session_header, woc_confirm_send and woc_discard_draft', { timeout: 20000 }, async () => {
+test('real panel boot: MCP_ALLOW_WRITE=1 exposes 14 tools including woc_session_header, woc_draft_image, woc_confirm_send and woc_discard_draft', { timeout: 20000 }, async () => {
   await withBootedPanel({ MCP_AUTH_TOKEN: TEST_TOKEN, MCP_ALLOW_WRITE: '1' }, async (url) => {
     const listRes = await rawHttp(`${url}/mcp`, {
       method: 'POST',
@@ -1855,14 +1857,143 @@ test('real panel boot: MCP_ALLOW_WRITE=1 exposes 13 tools including woc_session_
     assert.equal(listRes.status, 200);
     assert.equal(listRes.headers['cache-control'], 'no-store, max-age=0');
     const tools = JSON.parse(listRes.body).result.tools;
-    assert.equal(tools.length, 13);
+    assert.equal(tools.length, 14);
     const confirmTool = tools.find((t: any) => t.name === 'woc_confirm_send');
     const discardTool = tools.find((t: any) => t.name === 'woc_discard_draft');
+    const draftImageTool = tools.find((t: any) => t.name === 'woc_draft_image');
     const headerTool = tools.find((t: any) => t.name === 'woc_session_header');
     assert.ok(confirmTool);
     assert.ok(discardTool);
+    assert.ok(draftImageTool);
     assert.equal(headerTool.annotations?.readOnlyHint, true);
+    assert.equal(draftImageTool.annotations?.destructiveHint, false);
     assert.equal(confirmTool.annotations?.destructiveHint, true);
     assert.equal(discardTool.annotations?.idempotentHint, true);
   });
+});
+
+test('Phase 2 woc_draft_image: validates signature, pins header, pastes under lock, confirms send, never logs base64', async () => {
+  const PNG_1X1_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jV1kAAAAASUVORK5CYII=';
+  const events: string[] = [];
+  const logs: string[] = [];
+  let pasted = 0;
+  let cleared = 0;
+  let returns = 0;
+  let editorHasImage = false;
+
+  const baseHeader = Buffer.alloc(280 * 44, 240);
+  for (let y = 10; y < 30; y++) baseHeader.fill(40, y * 280 + 10, y * 280 + 90);
+  const emptyEditor = Buffer.alloc(1481 * 82, 240);
+  const imageEditor = Buffer.alloc(1481 * 82, 240);
+  for (let y = 10; y < 70; y++) imageEditor.fill(80, y * 1481 + 20, y * 1481 + 80);
+
+  const fpOf = (): SessionFingerprint => {
+    const editorGray = Buffer.from(editorHasImage ? imageEditor : emptyEditor);
+    const headerGray = Buffer.from(baseHeader);
+    return {
+      digest: 'img-fp-digest-0001',
+      headerDigest: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+      headerInkPixels: countHeaderInkPixels(headerGray).inkPixels,
+      displayWidth: 1836,
+      displayHeight: 884,
+      wechatWindow: { id: '10485776', x: 0, y: 0, width: 1836, height: 884, title: '微信' },
+      headerRegion: { x: 355, y: 12, width: 280, height: 44 },
+      editorRegion: { x: 355, y: 742, width: 1481, height: 82 },
+      headerGray,
+      editorGray,
+    };
+  };
+
+  const srv = await buildMockMcpServer({
+    allowWrite: true,
+    activeVncViewerCount: () => 0,
+    getControlLock: () => ({ active: false, holder: null, ageMs: null }),
+    sleep: async () => {},
+    clearInputInInstance: async (_inst, opts) => {
+      cleared++;
+      events.push(`clear:${opts?.lockHeld ? 'locked' : 'unlocked'}`);
+      editorHasImage = false;
+    },
+    pasteImageInInstance: async (_inst, mime, buf, opts) => {
+      pasted++;
+      events.push(`paste:${mime}:${buf.length}:${opts?.lockHeld ? 'locked' : 'unlocked'}`);
+      editorHasImage = true;
+    },
+    sendReturnInInstance: async () => {
+      returns++;
+      events.push('return');
+      editorHasImage = false;
+    },
+    withInputLock: async (_inst, op) => {
+      events.push('lock:enter');
+      try {
+        return await op();
+      } finally {
+        events.push('lock:exit');
+      }
+    },
+    captureSessionFingerprint: async () => fpOf(),
+    log: (line) => logs.push(line),
+  });
+  const call = async (id: number, name: string, args: Record<string, unknown>) => {
+    const res = await rawHttp(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }),
+    });
+    assert.equal(res.status, 200);
+    return JSON.parse(res.body);
+  };
+
+  try {
+    // 1. Signature mismatch rejected before touching instance
+    const badSig = await call(1, 'woc_draft_image', {
+      instance_id: RUNNING_INST.id,
+      image_base64: Buffer.from('not-a-png').toString('base64'),
+      mime_type: 'image/png',
+    });
+    assert.equal(badSig.result.isError, true);
+    assert.equal(pasted, 0);
+
+    // 2. Wrong expected_header_digest rejected with session_header_mismatch before pasting
+    const wrongHdr = await call(2, 'woc_draft_image', {
+      instance_id: RUNNING_INST.id,
+      image_base64: PNG_1X1_B64,
+      mime_type: 'image/png',
+      expected_header_digest: '0'.repeat(32),
+    });
+    assert.equal(JSON.parse(wrongHdr.result.content[0].text).error, 'session_header_mismatch');
+    assert.equal(pasted, 0);
+
+    // 3. Happy path: woc_session_header -> woc_draft_image -> woc_confirm_send
+    const hdr = JSON.parse((await call(3, 'woc_session_header', { instance_id: RUNNING_INST.id })).result.content[1].text);
+    const drafted = await call(4, 'woc_draft_image', {
+      instance_id: RUNNING_INST.id,
+      image_base64: PNG_1X1_B64,
+      mime_type: 'image/png',
+      expected_header_digest: hdr.header_digest,
+    });
+    const draftPayload = JSON.parse(drafted.result.content[1].text);
+    assert.equal(draftPayload.ok, true);
+    assert.equal(draftPayload.mime_type, 'image/png');
+    assert.equal(draftPayload.image_bytes, Buffer.from(PNG_1X1_B64, 'base64').length);
+    assert.equal(cleared, 1);
+    assert.equal(pasted, 1);
+    assert.ok(events.includes(`paste:image/png:${draftPayload.image_bytes}:locked`));
+
+    const confirmed = await call(5, 'woc_confirm_send', {
+      instance_id: RUNNING_INST.id,
+      draft_id: draftPayload.draft_id,
+    });
+    const confirmPayload = JSON.parse(confirmed.result.content[0].text);
+    assert.equal(confirmPayload.ok, true);
+    assert.equal(confirmPayload.sent, true);
+    assert.equal(confirmPayload.send_verified, true);
+    assert.equal(returns, 1);
+
+    // Privacy: base64 image data must never appear in audit logs
+    assert.ok(logs.every((l) => !l.includes(PNG_1X1_B64.slice(0, 16))));
+  } finally {
+    await srv.close();
+  }
 });

@@ -1532,6 +1532,7 @@ registerMcp(app, {
   clickInInstance,
   scrollInInstance,
   typeInInstance,
+  pasteImageInInstance,
   clearInputInInstance,
   sendReturnInInstance,
   withInputLock: withInstanceInputLock,

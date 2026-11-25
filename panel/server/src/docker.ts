@@ -1088,10 +1088,15 @@ timeout 5 xclip -selection clipboard -t image/png -o 2>/dev/null | head -c 67108
 }
 
 // Image API never retries a possibly dispatched Ctrl+V.
-export async function pasteImageInInstance(inst: Instance, mime: string, content: Buffer): Promise<void> {
+export async function pasteImageInInstance(
+  inst: Instance,
+  mime: string,
+  content: Buffer,
+  opts: { lockHeld?: boolean } = {},
+): Promise<void> {
   requireSupportedApp(inst);
   validatePasteImage(mime, content);
-  return withInstanceInput(inst.containerName, async () => {
+  const run = async (): Promise<void> => {
     let dir = '';
     try {
       dir = (await execCapture(inst, ['mktemp', '-d', '/tmp/woc-paste-XXXXXXXXXXXX'], 'abc', 10000)).trim();
@@ -1109,7 +1114,9 @@ export async function pasteImageInInstance(inst: Instance, mime: string, content
       await execCapture(inst, ['rm', '-f', '--', dir + '/image'], 'abc', 5000).catch(() => {});
       await execCapture(inst, ['rmdir', '--', dir], 'abc', 5000).catch(() => {});
     }
-  });
+  };
+  if (opts.lockHeld) await run();
+  else await withInstanceInput(inst.containerName, run);
 }
 
 // 通过 xdotool 在实例容器内输入文字（绕过 VNC keysym 限制，解决中文 IME 吞字问题）。

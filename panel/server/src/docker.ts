@@ -2075,12 +2075,15 @@ export function isInSendButtonZone(x: number, y: number, win: WechatWindowRect |
   );
 }
 
-// ---------- 微信 4.1.1.8 原生 1:1 标题栏 + 解耦输入区灰度指纹（零落盘、单帧原子采集） ----------
+// ---------- 微信 4.1.1.8 原生 1:1 标题栏 + 多帧标定输入区灰度指纹（零落盘、单帧原子采集） ----------
 export const EDITOR_FINGERPRINT_HEIGHT = 32;
 export const HEADER_INK_DELTA = 20;
 // 实测 1836x884「文件传输助手」(6 汉字)在 280x44 原生标题区占 721 px (|px-bg|>=20)；
 // 2 汉字约 240 px，取 75 px 作为防空白下限，兼顾细笔画短名且稳定拦截空白标题栏。
 export const MIN_HEADER_INK_PIXELS = 75;
+// 实测 3 帧采样取最小差异（t=0, 350ms, 700ms）：同草稿闪烁噪声上限 diff_pixels=0，
+// 单字改动信号下限 diff_pixels=33；取 4 作为严格上限（8.25x 安全余量）。
+export const DEFAULT_EDITOR_MAX_DIFF_PIXELS = 4;
 
 export interface SessionFingerprint {
   displayWidth: number;
@@ -2193,13 +2196,14 @@ export function countHeaderInkPixels(buf: Buffer): { bg: number; inkPixels: numb
 // 对比草稿期与确认期的会话指纹：
 // 1. 窗口/屏幕/裁剪区几何必须完全一致（否则 window_geometry_mismatch）；
 // 2. HEADER 原生 1:1 灰度图逐像素精确比对，零容差（diffPixels === 0，差 1 像素即 session_fingerprint_mismatch）；
-// 3. EDITOR 完全解耦：默认 editorMaxDiffPixels=null（仅输出诊断指标，不预设拦截阈值）；显式传入阈值后超限才拒（editor_fingerprint_mismatch）。
+// 3. EDITOR 使用 280x32 灰度图 diffPixels 比对，默认上限 DEFAULT_EDITOR_MAX_DIFF_PIXELS=4（配合确认时最多 3 帧早退采样消除光标闪烁）；显式传入 null 可退回仅诊断模式。
 export function compareSessionFingerprints(
   draft: SessionFingerprint,
   live: SessionFingerprint,
   opts: { editorMaxDiffPixels?: number | null } = {},
 ): FingerprintComparison {
-  const maxEditorDiff = opts.editorMaxDiffPixels ?? null;
+  const maxEditorDiff =
+    opts.editorMaxDiffPixels === undefined ? DEFAULT_EDITOR_MAX_DIFF_PIXELS : opts.editorMaxDiffPixels;
   const failHeader: HeaderCheckMetrics = { match: false, diffPixels: -1, totalPixels: draft.headerGray.length, meanAbsDiff: 255 };
   const failEditor: EditorCheckMetrics = {
     enforced: maxEditorDiff !== null,
@@ -2287,7 +2291,7 @@ export function compareSessionFingerprints(
     const meanAbsDiff = Number((absSum / expectedEditorLen).toFixed(4));
     const changedPixelRatio = Number((changedPixels20 / expectedEditorLen).toFixed(4));
     const enforced = maxEditorDiff !== null;
-    const match = !enforced || changedPixels20 <= maxEditorDiff;
+    const match = !enforced || diffPixels <= maxEditorDiff;
     editorCheck = {
       enforced,
       match,
@@ -2313,7 +2317,7 @@ export function compareSessionFingerprints(
     return {
       match: false,
       reason: 'editor_fingerprint_mismatch',
-      detail: `输入编辑区像素变化超出阈值（changed_pixels_20=${editorCheck.changedPixels20} > ${editorCheck.maxDiffPixels}）`,
+      detail: `输入编辑区像素变化超出阈值（diff_pixels=${editorCheck.diffPixels} > ${editorCheck.maxDiffPixels}）`,
       headerCheck,
       editorCheck,
     };

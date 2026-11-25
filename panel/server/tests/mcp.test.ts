@@ -19,6 +19,7 @@ import {
   computeEditorRegion,
   computeHeaderRegion,
   countHeaderInkPixels,
+  DEFAULT_EDITOR_MAX_DIFF_PIXELS,
   EDITOR_FINGERPRINT_HEIGHT,
   isInSendButtonZone,
   MIN_HEADER_INK_PIXELS,
@@ -805,7 +806,9 @@ test('computeHeaderRegion, countHeaderInkPixels, exact 1:1 header match (0px tol
   assert.equal(sameCmp.match, true);
   assert.equal(sameCmp.headerCheck.match, true);
   assert.equal(sameCmp.headerCheck.diffPixels, 0);
-  assert.equal(sameCmp.editorCheck.enforced, false);
+  assert.equal(sameCmp.editorCheck.enforced, true);
+  assert.equal(sameCmp.editorCheck.maxDiffPixels, DEFAULT_EDITOR_MAX_DIFF_PIXELS);
+  assert.equal(sameCmp.editorCheck.diffPixels, 0);
   assert.equal(sameCmp.editorCheck.match, true);
 
   // 3. Single 1-pixel difference in header MUST be rejected (diff_pixels: 1 -> session_fingerprint_mismatch)
@@ -827,32 +830,31 @@ test('computeHeaderRegion, countHeaderInkPixels, exact 1:1 header match (0px tol
   assert.equal(crossCmp.reason, 'session_fingerprint_mismatch');
   assert.equal(crossCmp.headerCheck.diffPixels, 480);
 
-  // 5. Decoupled editor: default (editorMaxDiffPixels=null) is diagnostic-only and does NOT reject
+  // 5. Default editor check enforces diff_pixels <= DEFAULT_EDITOR_MAX_DIFF_PIXELS (4); null opts into diagnostic-only
   const fpEditedEditor = makeTestFingerprint({
     headerGray: Buffer.from(fpA.headerGray),
     editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 500, 300, 15),
   });
-  const diagCmp = compareSessionFingerprints(fpA, fpEditedEditor);
+  const defaultEnforcedFail = compareSessionFingerprints(fpA, fpEditedEditor);
+  assert.equal(defaultEnforcedFail.match, false);
+  assert.equal(defaultEnforcedFail.reason, 'editor_fingerprint_mismatch');
+  assert.equal(defaultEnforcedFail.editorCheck.enforced, true);
+  assert.equal(defaultEnforcedFail.editorCheck.maxDiffPixels, DEFAULT_EDITOR_MAX_DIFF_PIXELS);
+
+  const diagCmp = compareSessionFingerprints(fpA, fpEditedEditor, { editorMaxDiffPixels: null });
   assert.equal(diagCmp.match, true);
   assert.equal(diagCmp.headerCheck.diffPixels, 0);
   assert.equal(diagCmp.editorCheck.enforced, false);
   assert.equal(diagCmp.editorCheck.maxDiffPixels, null);
-  assert.ok(diagCmp.editorCheck.changedPixels20 > 100);
+  assert.ok(diagCmp.editorCheck.diffPixels > 100);
 
-  // Enforced editor mode: rejects when changedPixels20 > threshold, allows tiny caret blink <= threshold
-  const enforcedFail = compareSessionFingerprints(fpA, fpEditedEditor, { editorMaxDiffPixels: 20 });
-  assert.equal(enforcedFail.match, false);
-  assert.equal(enforcedFail.reason, 'editor_fingerprint_mismatch');
-  assert.equal(enforcedFail.editorCheck.enforced, true);
-  assert.equal(enforcedFail.editorCheck.match, false);
-
-  const caretBlinkEditor = Buffer.from(fpA.editorGray);
-  for (let i = 0; i < 8; i++) caretBlinkEditor[2000 + i] = 20;
-  const fpCaret = makeTestFingerprint({ headerGray: Buffer.from(fpA.headerGray), editorGray: caretBlinkEditor });
-  const enforcedCaretOk = compareSessionFingerprints(fpA, fpCaret, { editorMaxDiffPixels: 20 });
-  assert.equal(enforcedCaretOk.match, true);
-  assert.equal(enforcedCaretOk.editorCheck.enforced, true);
-  assert.equal(enforcedCaretOk.editorCheck.changedPixels20, 8);
+  // Small diff <= 4 passes default threshold
+  const tinyDiffEditor = Buffer.from(fpA.editorGray);
+  for (let i = 0; i < 4; i++) tinyDiffEditor[2000 + i] = 20;
+  const fpTinyDiff = makeTestFingerprint({ headerGray: Buffer.from(fpA.headerGray), editorGray: tinyDiffEditor });
+  const tinyOk = compareSessionFingerprints(fpA, fpTinyDiff);
+  assert.equal(tinyOk.match, true);
+  assert.equal(tinyOk.editorCheck.diffPixels, 4);
 
   // Window geometry resized -> window_geometry_mismatch
   const fpResized = makeTestFingerprint({ displayWidth: 1600, displayHeight: 900, winW: 1600, winH: 900 });
@@ -1093,10 +1095,12 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     });
     const confirmOkBody = JSON.parse(confirmOk.result.content[0].text);
     assert.equal(confirmOkBody.sent, true);
+    assert.equal(confirmOkBody.samples_taken, 1);
     assert.equal(confirmOkBody.header_check.match, true);
     assert.equal(confirmOkBody.header_check.diff_pixels, 0);
-    assert.equal(confirmOkBody.editor_check.enforced, false);
+    assert.equal(confirmOkBody.editor_check.enforced, true);
     assert.equal(confirmOkBody.editor_check.match, true);
+    assert.equal(confirmOkBody.editor_check.diff_pixels, 0);
     assert.deepEqual(keysSent, ['Return']);
 
     // 6a. Blank header rejected on woc_draft_reply with header_blank (no draft_id issued!)
@@ -1198,40 +1202,29 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     assert.equal(confirmFpFail.header_check.diff_pixels, 1);
     assert.equal(keysSent.length, 1);
 
-    // 9b. Decoupled editor diagnostic mode (default editorMaxDiffPixels=null):
-    // editor diff is reported in editor_check (enforced: false) without blocking when header matches 100%
+    // 9b. Editor change across all 3 samples -> editor_fingerprint_mismatch (default threshold=4)
     liveFingerprint = makeTestFingerprint();
-    const draftEdRes = await rpc(2101, 'tools/call', {
-      name: 'woc_draft_reply',
-      arguments: { instance_id: RUNNING_INST.id, text: 'editor-diag-check' },
-    });
-    const edId = JSON.parse(draftEdRes.result.content[1].text).draft_id;
-    liveFingerprint = makeTestFingerprint({
-      headerGray: Buffer.from(liveFingerprint.headerGray),
-      editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 200, 150, 15),
-    });
     fakeNow += 61_000;
-    // Create a fresh draft to confirm editor diagnostic pass (within 60s TTL)
-    liveFingerprint = makeTestFingerprint();
     const draftEdRes2 = await rpc(2102, 'tools/call', {
       name: 'woc_draft_reply',
-      arguments: { instance_id: RUNNING_INST.id, text: 'editor-diag-ok' },
+      arguments: { instance_id: RUNNING_INST.id, text: 'editor-enforced-check' },
     });
     const edId2 = JSON.parse(draftEdRes2.result.content[1].text).draft_id;
     liveFingerprint = makeTestFingerprint({
       headerGray: Buffer.from(liveFingerprint.headerGray),
       editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 400, 180, 15),
     });
-    const confirmEdDiag = JSON.parse((await rpc(2103, 'tools/call', {
+    const confirmEdFail = JSON.parse((await rpc(2103, 'tools/call', {
       name: 'woc_confirm_send',
       arguments: { instance_id: RUNNING_INST.id, draft_id: edId2 },
     })).result.content[0].text);
-    assert.equal(confirmEdDiag.sent, true);
-    assert.equal(confirmEdDiag.header_check.diff_pixels, 0);
-    assert.equal(confirmEdDiag.editor_check.enforced, false);
-    assert.ok(confirmEdDiag.editor_check.changed_pixels_20 > 0);
-    assert.equal(keysSent.length, 2);
-    void edId;
+    assert.equal(confirmEdFail.error, 'editor_fingerprint_mismatch');
+    assert.equal(confirmEdFail.samples_taken, 3);
+    assert.equal(confirmEdFail.header_check.diff_pixels, 0);
+    assert.equal(confirmEdFail.editor_check.enforced, true);
+    assert.equal(confirmEdFail.editor_check.match, false);
+    assert.equal(confirmEdFail.input_may_have_residual_draft, true);
+    assert.equal(keysSent.length, 1);
 
     // 10. Window geometry mismatch -> aborted & consumed
     liveFingerprint = makeTestFingerprint();
@@ -1249,7 +1242,7 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     })).result.content[0].text);
     assert.equal(confirmGeoFail.error, 'window_geometry_mismatch');
     assert.equal(confirmGeoFail.input_may_have_residual_draft, true);
-    assert.equal(keysSent.length, 2);
+    assert.equal(keysSent.length, 1);
 
     // 11. Send error -> send_uncertain_no_retry, NO auto-retry, draft consumed, residual flag
     liveFingerprint = makeTestFingerprint();
@@ -1268,7 +1261,7 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     const confirmErrBody = JSON.parse(confirmErr.result.content[0].text);
     assert.equal(confirmErrBody.error, 'send_uncertain_no_retry');
     assert.equal(confirmErrBody.input_may_have_residual_draft, true);
-    assert.equal(keysSent.length, 3); // called strictly once for this send, zero auto-retry!
+    assert.equal(keysSent.length, 2); // called strictly once for this send, zero auto-retry!
     assert.equal(JSON.parse((await rpc(28, 'tools/call', { name: 'woc_confirm_send', arguments: { instance_id: RUNNING_INST.id, draft_id: errId2 } })).result.content[0].text).error, 'draft_not_found');
     keyThrows = false;
 
@@ -1342,20 +1335,45 @@ test('Phase 2 general write rate limiter enforces per-minute window', async () =
   }
 });
 
-test('Phase 2 enforced editorMaxDiffPixels rejects editor changes while allowing small caret blink', async () => {
-  let liveFp = makeTestFingerprint();
+test('Phase 2 multi-sample early-exit EDITOR verification (blink recovery, 1-char edit rejection, Sample-2 header abort)', async () => {
+  const baseFp = makeTestFingerprint();
+  const makeEditorDiffFp = (diffCount: number, headerChanged = false): SessionFingerprint => {
+    const hGray = Buffer.from(baseFp.headerGray);
+    if (headerChanged) hGray[10] = hGray[10] === 237 ? 20 : 237;
+    const eGray = Buffer.from(baseFp.editorGray);
+    for (let i = 0; i < diffCount; i++) {
+      eGray[1000 + i] = eGray[1000 + i] === 250 ? 20 : 250;
+    }
+    return makeTestFingerprint({ headerGray: hGray, editorGray: eGray });
+  };
+
+  let fakeNow = 1_700_000_000_000;
+  let queue: SessionFingerprint[] = [];
+  let captureCount = 0;
+  const sleeps: number[] = [];
   const keysSent: string[] = [];
+
   const srv = await buildMockMcpServer({
     allowWrite: true,
-    editorMaxDiffPixels: 15,
+    now: () => fakeNow,
+    confirmMaxSamples: 3,
+    confirmSampleDelayMs: 350,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+    rateLimits: { writeMaxPerWindow: 30, sendMaxPerWindow: 10, sendMinIntervalMs: 1000 },
     activeVncViewerCount: () => 0,
     getControlLock: () => ({ active: false, holder: null, ageMs: null }),
     typeInInstance: async () => {},
     keyInInstance: async (_inst, key) => {
       keysSent.push(key);
     },
-    captureSessionFingerprint: async () => liveFp,
+    captureSessionFingerprint: async () => {
+      captureCount++;
+      return queue.shift() ?? baseFp;
+    },
   });
+
   const callTool = async (id: number, name: string, args: Record<string, unknown>) => {
     const res = await rawHttp(`${srv.url}/mcp`, {
       method: 'POST',
@@ -1365,20 +1383,56 @@ test('Phase 2 enforced editorMaxDiffPixels rejects editor changes while allowing
     assert.equal(res.status, 200);
     return JSON.parse(res.body);
   };
+
   try {
-    // Draft -> major editor change -> rejected with editor_fingerprint_mismatch
-    const d1 = JSON.parse((await callTool(1, 'woc_draft_reply', { instance_id: RUNNING_INST.id, text: 'enforced-1' })).result.content[1].text).draft_id;
-    liveFp = makeTestFingerprint({
-      headerGray: Buffer.from(liveFp.headerGray),
-      editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 500, 200, 15),
-    });
+    // Case 1: Early-exit on Sample 1 (diff=0 -> only 1 confirm capture taken, 0 sleeps)
+    queue = [baseFp, baseFp];
+    captureCount = 0;
+    const d1 = JSON.parse((await callTool(1, 'woc_draft_reply', { instance_id: RUNNING_INST.id, text: 'early-exit' })).result.content[1].text).draft_id;
     const r1 = JSON.parse((await callTool(2, 'woc_confirm_send', { instance_id: RUNNING_INST.id, draft_id: d1 })).result.content[0].text);
-    assert.equal(r1.error, 'editor_fingerprint_mismatch');
-    assert.equal(r1.input_may_have_residual_draft, true);
-    assert.equal(r1.header_check.diff_pixels, 0);
-    assert.equal(r1.editor_check.enforced, true);
-    assert.equal(r1.editor_check.match, false);
-    assert.equal(keysSent.length, 0);
+    assert.equal(r1.sent, true);
+    assert.equal(r1.samples_taken, 1);
+    assert.equal(r1.editor_check.diff_pixels, 0);
+    assert.equal(captureCount, 2); // 1 draft + 1 confirm
+    assert.equal(sleeps.length, 0);
+
+    // Case 2: Blinking-caret recovery on Sample 2 ([43, 0] -> PASS with samples_taken: 2)
+    fakeNow += 5_000;
+    queue = [baseFp, makeEditorDiffFp(43), makeEditorDiffFp(0)];
+    captureCount = 0;
+    const d2 = JSON.parse((await callTool(3, 'woc_draft_reply', { instance_id: RUNNING_INST.id, text: 'caret-recover' })).result.content[1].text).draft_id;
+    const r2 = JSON.parse((await callTool(4, 'woc_confirm_send', { instance_id: RUNNING_INST.id, draft_id: d2 })).result.content[0].text);
+    assert.equal(r2.sent, true);
+    assert.equal(r2.samples_taken, 2);
+    assert.equal(r2.editor_check.diff_pixels, 0);
+    assert.equal(captureCount, 3); // 1 draft + 2 confirm
+    assert.deepEqual(sleeps, [350]);
+
+    // Case 3: Real 1-char edit rejected across all 3 samples ([76, 33, 33] -> editor_fingerprint_mismatch, best diff=33)
+    fakeNow += 5_000;
+    queue = [baseFp, makeEditorDiffFp(76), makeEditorDiffFp(33), makeEditorDiffFp(33)];
+    captureCount = 0;
+    const d3 = JSON.parse((await callTool(5, 'woc_draft_reply', { instance_id: RUNNING_INST.id, text: 'one-char-edit' })).result.content[1].text).draft_id;
+    const r3 = JSON.parse((await callTool(6, 'woc_confirm_send', { instance_id: RUNNING_INST.id, draft_id: d3 })).result.content[0].text);
+    assert.equal(r3.error, 'editor_fingerprint_mismatch');
+    assert.equal(r3.samples_taken, 3);
+    assert.equal(r3.editor_check.diff_pixels, 33);
+    assert.equal(r3.input_may_have_residual_draft, true);
+    assert.equal(captureCount, 4); // 1 draft + 3 confirm
+    assert.equal(keysSent.length, 2); // NOT sent
+
+    // Case 4: Header mismatch on Sample 2 immediately aborts without taking Sample 3
+    fakeNow += 5_000;
+    queue = [baseFp, makeEditorDiffFp(43, false), makeEditorDiffFp(0, true), makeEditorDiffFp(0, false)];
+    captureCount = 0;
+    const d4 = JSON.parse((await callTool(7, 'woc_draft_reply', { instance_id: RUNNING_INST.id, text: 'hdr-abort-s2' })).result.content[1].text).draft_id;
+    const r4 = JSON.parse((await callTool(8, 'woc_confirm_send', { instance_id: RUNNING_INST.id, draft_id: d4 })).result.content[0].text);
+    assert.equal(r4.error, 'session_fingerprint_mismatch');
+    assert.equal(r4.samples_taken, 2);
+    assert.equal(r4.header_check.diff_pixels, 1);
+    assert.equal(r4.input_may_have_residual_draft, true);
+    assert.equal(captureCount, 3); // 1 draft + 2 confirm (did NOT take Sample 3!)
+    assert.equal(keysSent.length, 2);
   } finally {
     await srv.close();
   }

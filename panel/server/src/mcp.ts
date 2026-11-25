@@ -10,11 +10,13 @@ import {
 } from './store.js';
 import {
   compareSessionFingerprints,
+  DEFAULT_EDITOR_MAX_DIFF_PIXELS,
   DisplaySizeMismatchError,
   isInSendButtonZone,
   MIN_HEADER_INK_PIXELS,
   type ClickOptions,
   type EditorCheckMetrics,
+  type FingerprintComparison,
   type HeaderCheckMetrics,
   type MouseButton,
   type RuntimeState,
@@ -41,6 +43,8 @@ const MAX_SCREENSHOT_MAX_WIDTH = 2560;
 const MAX_DRAFT_TEXT_CHARS = 500;
 const DEFAULT_DRAFT_TTL_MS = 60_000;
 const MAX_DRAFT_ENTRIES = 32;
+const DEFAULT_CONFIRM_MAX_SAMPLES = 3;
+const DEFAULT_CONFIRM_SAMPLE_DELAY_MS = 350;
 const DEFAULT_WRITE_WINDOW_MS = 60_000;
 const DEFAULT_WRITE_MAX_PER_WINDOW = 20;
 const DEFAULT_SEND_WINDOW_MS = 60_000;
@@ -92,6 +96,9 @@ export interface McpDeps {
   hasActiveSession: (id: string) => boolean;
   draftTtlMs?: number;
   editorMaxDiffPixels?: number | null;
+  confirmMaxSamples?: number;
+  confirmSampleDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
   rateLimits?: WriteRateLimitConfig;
   now?: () => number;
   log?: (line: string) => void;
@@ -1445,10 +1452,47 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
             throw new Error('confirm send handlers not configured');
           }
 
-          const liveFp = await deps.captureSessionFingerprint(inst);
-          const cmp = compareSessionFingerprints(draft.fingerprint, liveFp, {
-            editorMaxDiffPixels: deps.editorMaxDiffPixels ?? null,
-          });
+          const maxSamples = Math.max(1, deps.confirmMaxSamples ?? DEFAULT_CONFIRM_MAX_SAMPLES);
+          const sampleDelayMs = Math.max(0, deps.confirmSampleDelayMs ?? DEFAULT_CONFIRM_SAMPLE_DELAY_MS);
+          const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+          const editorMaxDiff =
+            deps.editorMaxDiffPixels === undefined ? DEFAULT_EDITOR_MAX_DIFF_PIXELS : deps.editorMaxDiffPixels;
+
+          let samplesTaken = 0;
+          let finalCmp: FingerprintComparison | null = null;
+          let bestCmp: FingerprintComparison | null = null;
+
+          for (let attempt = 1; attempt <= maxSamples; attempt++) {
+            if (attempt > 1 && sampleDelayMs > 0) {
+              await sleep(sampleDelayMs);
+            }
+            const liveFp = await deps.captureSessionFingerprint(inst);
+            const attemptCmp = compareSessionFingerprints(draft.fingerprint, liveFp, {
+              editorMaxDiffPixels: editorMaxDiff,
+            });
+            samplesTaken = attempt;
+
+            // Geometry or header mismatch aborts immediately on ANY sample (zero tolerance).
+            if (
+              attemptCmp.reason === 'window_geometry_mismatch' ||
+              attemptCmp.reason === 'session_fingerprint_mismatch'
+            ) {
+              finalCmp = attemptCmp;
+              break;
+            }
+
+            if (!bestCmp || attemptCmp.editorCheck.diffPixels < bestCmp.editorCheck.diffPixels) {
+              bestCmp = attemptCmp;
+            }
+
+            // Early exit as soon as header matches (0px) and editor diff is within threshold.
+            if (attemptCmp.match) {
+              finalCmp = attemptCmp;
+              break;
+            }
+          }
+
+          const cmp = finalCmp ?? bestCmp!;
           const formatHeaderCheck = (m: HeaderCheckMetrics) => ({
             match: m.match,
             diff_pixels: m.diffPixels,
@@ -1473,6 +1517,7 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
               error: errCode,
               instance_id: id,
               detail: cmp.detail,
+              samples_taken: samplesTaken,
               header_check: formatHeaderCheck(cmp.headerCheck),
               editor_check: formatEditorCheck(cmp.editorCheck),
               ...residualMeta,
@@ -1505,6 +1550,7 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
             sent: true,
             instance_id: id,
             text_length: draft.textLength,
+            samples_taken: samplesTaken,
             header_check: formatHeaderCheck(cmp.headerCheck),
             editor_check: formatEditorCheck(cmp.editorCheck),
           });

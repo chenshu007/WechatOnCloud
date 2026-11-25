@@ -15,14 +15,25 @@ import {
 import {
   clampScreenshotCrop,
   collectDemuxedStream,
+  compareSessionFingerprints,
+  computeEditorRegion,
+  computeGrayscaleDHash,
+  computeHeaderRegion,
+  FINGERPRINT_RAW_BYTES,
+  isInSendButtonZone,
   parsePngDimensions,
   parseWechatWindowInfo,
+  type ClickOptions,
   type RuntimeState,
   type ScreenshotOptions,
+  type ScrollOptions,
+  type SessionFingerprint,
+  type TypeOptions,
 } from '../src/docker.js';
 import {
   isOriginAllowed,
   MCP_TOOLS,
+  MCP_WRITE_TOOLS,
   registerMcp,
   verifyBearerToken,
   type McpDeps,
@@ -706,5 +717,569 @@ test('real panel boot: /mcp enforces auth/host/origin/method and serves initiali
     assert.equal(healthPayload.ok, true);
     assert.equal(healthPayload.socket_proxy_ok, false);
     assert.equal(healthPayload.instances.total, 0);
+  });
+});
+
+// ---------- Phase 2: Controlled Write Tools & Session Fingerprint Tests ----------
+
+function makeGrayBitmap(fill = 240, accentStart = 0, accentLen = 0, accentVal = 30): Buffer {
+  const buf = Buffer.alloc(FINGERPRINT_RAW_BYTES, fill);
+  for (let i = accentStart; i < Math.min(buf.length, accentStart + accentLen); i++) {
+    buf[i] = accentVal;
+  }
+  return buf;
+}
+
+function makeTestFingerprint(opts: {
+  displayWidth?: number;
+  displayHeight?: number;
+  winW?: number;
+  winH?: number;
+  headerGray?: Buffer;
+  editorGray?: Buffer;
+} = {}): SessionFingerprint {
+  const displayWidth = opts.displayWidth ?? 1836;
+  const displayHeight = opts.displayHeight ?? 884;
+  const wechatWindow = {
+    id: '10485776',
+    x: 0,
+    y: 0,
+    width: opts.winW ?? displayWidth,
+    height: opts.winH ?? displayHeight,
+    title: '微信',
+  };
+  const headerRegion = computeHeaderRegion(wechatWindow, displayWidth, displayHeight)!;
+  const editorRegion = computeEditorRegion(wechatWindow, displayWidth, displayHeight)!;
+  const headerGray = opts.headerGray ?? makeGrayBitmap(240, 10, 80, 30);
+  const editorGray = opts.editorGray ?? makeGrayBitmap(250, 20, 60, 40);
+  return {
+    displayWidth,
+    displayHeight,
+    wechatWindow,
+    headerRegion,
+    editorRegion,
+    headerGray,
+    editorGray,
+    headerDhash: computeGrayscaleDHash(headerGray),
+    editorDhash: computeGrayscaleDHash(editorGray),
+    digest: '0123456789abcdef',
+  };
+}
+
+test('computeHeaderRegion, computeEditorRegion, isInSendButtonZone, and compareSessionFingerprints', () => {
+  const win = { id: '1', x: 0, y: 0, width: 1836, height: 884, title: '微信' };
+  const headerRegion = computeHeaderRegion(win, 1836, 884);
+  assert.deepEqual(headerRegion, { x: 355, y: 6, width: 520, height: 58 });
+  const editorRegion = computeEditorRegion(win, 1836, 884);
+  assert.deepEqual(editorRegion, { x: 355, y: 742, width: 1461, height: 82 });
+  assert.equal(computeHeaderRegion({ ...win, width: 400, height: 200 }, 1836, 884), null);
+  assert.equal(computeEditorRegion({ ...win, width: 400, height: 200 }, 1836, 884), null);
+
+  // Send button zone guard
+  assert.equal(isInSendButtonZone(1750, 850, win), true);
+  assert.equal(isInSendButtonZone(1676, 812, win), true);
+  assert.equal(isInSendButtonZone(1675, 850, win), false);
+  assert.equal(isInSendButtonZone(1750, 811, win), false);
+  assert.equal(isInSendButtonZone(1750, 850, null), false);
+
+  const fpA = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 16, 60, 25), editorGray: makeGrayBitmap(250, 20, 60, 40) });
+  const fpSame = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 16, 60, 25), editorGray: makeGrayBitmap(250, 20, 60, 40) });
+  const sameCmp = compareSessionFingerprints(fpA, fpSame);
+  assert.equal(sameCmp.match, true);
+  assert.equal(sameCmp.headerCheck.match, true);
+  assert.equal(sameCmp.editorCheck.match, true);
+
+  // Small caret blink in editor (e.g. 6 pixels out of 1024 = 0.59% changed) still matches
+  const caretBlink = Buffer.from(fpA.editorGray);
+  for (let i = 0; i < 6; i++) caretBlink[300 + i] = 20;
+  const fpCaret = makeTestFingerprint({ headerGray: fpA.headerGray, editorGray: caretBlink });
+  const caretCmp = compareSessionFingerprints(fpA, fpCaret);
+  assert.equal(caretCmp.match, true);
+  assert.equal(caretCmp.editorCheck.match, true);
+
+  // Contact name changed -> session_fingerprint_mismatch
+  const fpOtherChat = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 180, 120, 20), editorGray: fpA.editorGray });
+  const diffChat = compareSessionFingerprints(fpA, fpOtherChat);
+  assert.equal(diffChat.match, false);
+  assert.equal(diffChat.reason, 'session_fingerprint_mismatch');
+
+  // Editor text changed while header stayed identical -> editor_fingerprint_mismatch
+  const fpEditedDraft = makeTestFingerprint({ headerGray: fpA.headerGray, editorGray: makeGrayBitmap(250, 120, 150, 20) });
+  const diffEditor = compareSessionFingerprints(fpA, fpEditedDraft);
+  assert.equal(diffEditor.match, false);
+  assert.equal(diffEditor.reason, 'editor_fingerprint_mismatch');
+  assert.equal(diffEditor.headerCheck.match, true);
+  assert.equal(diffEditor.editorCheck.match, false);
+
+  // Window geometry resized -> window_geometry_mismatch
+  const fpResized = makeTestFingerprint({ displayWidth: 1600, displayHeight: 900, winW: 1600, winH: 900 });
+  const diffGeo = compareSessionFingerprints(fpA, fpResized);
+  assert.equal(diffGeo.match, false);
+  assert.equal(diffGeo.reason, 'window_geometry_mismatch');
+});
+
+test('Phase 2 feature gate: MCP_ALLOW_WRITE unset/0 exposes only 7 read-only tools and rejects write tools', async () => {
+  const srv = await buildMockMcpServer({ allowWrite: false });
+  const rpc = async (id: number, method: string, params?: Record<string, unknown>) => {
+    const res = await rawHttp(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: JSON.stringify({ jsonrpc: '2.0', id, method, ...(params ? { params } : {}) }),
+    });
+    assert.equal(res.status, 200);
+    return JSON.parse(res.body);
+  };
+  try {
+    const list = await rpc(1, 'tools/list');
+    assert.equal(list.result.tools.length, 7);
+    for (const writeTool of MCP_WRITE_TOOLS) {
+      const res = await rpc(2, 'tools/call', { name: writeTool.name, arguments: {} });
+      assert.equal(res.result.isError, true);
+      assert.equal(JSON.parse(res.result.content[0].text).error, 'unknown_tool');
+    }
+  } finally {
+    await srv.close();
+  }
+});
+
+test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, draft->confirm/discard, guards, rate limits, privacy', async () => {
+  let fakeNow = 1_700_000_000_000;
+  let liveDisplayW = 1836;
+  let liveDisplayH = 884;
+  let viewers = 0;
+  let controlActive = false;
+  let liveFingerprint = makeTestFingerprint();
+  let keyThrows = false;
+  const clicks: ClickOptions[] = [];
+  const scrolls: ScrollOptions[] = [];
+  const typed: Array<{ text: string; opts?: TypeOptions }> = [];
+  const cleared: string[] = [];
+  const keysSent: string[] = [];
+
+  const srv = await buildMockMcpServer({
+    allowWrite: true,
+    now: () => fakeNow,
+    draftTtlMs: 60_000,
+    rateLimits: {
+      writeWindowMs: 60_000,
+      writeMaxPerWindow: 40,
+      sendWindowMs: 60_000,
+      sendMaxPerWindow: 2,
+      sendMinIntervalMs: 3_000,
+    },
+    activeVncViewerCount: () => viewers,
+    getControlLock: () => (controlActive ? { active: true, holder: 'admin', ageMs: 500 } : { active: false, holder: null, ageMs: null }),
+    wechatWindowInfo: async () => ({
+      display: ':1',
+      displayWidth: liveDisplayW,
+      displayHeight: liveDisplayH,
+      wechatWindow: { id: '10485776', x: 0, y: 0, width: liveDisplayW, height: liveDisplayH, title: '微信' },
+    }),
+    clickInInstance: async (_inst, opts) => {
+      clicks.push(opts);
+      return { displayWidth: liveDisplayW, displayHeight: liveDisplayH };
+    },
+    scrollInInstance: async (_inst, opts) => {
+      scrolls.push(opts);
+      return { displayWidth: liveDisplayW, displayHeight: liveDisplayH };
+    },
+    typeInInstance: async (_inst, text, opts) => {
+      typed.push({ text, opts });
+    },
+    clearInputInInstance: async (inst) => {
+      cleared.push(inst.id);
+    },
+    keyInInstance: async (_inst, key) => {
+      keysSent.push(key);
+      if (keyThrows) throw new Error('exec timeout');
+    },
+    captureSessionFingerprint: async () => liveFingerprint,
+  });
+
+  const rpc = async (id: number, method: string, params?: Record<string, unknown>) => {
+    const res = await rawHttp(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: JSON.stringify({ jsonrpc: '2.0', id, method, ...(params ? { params } : {}) }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers['cache-control'], 'no-store, max-age=0');
+    return JSON.parse(res.body);
+  };
+
+  try {
+    // 1. tools/list returns exact 12 tools with expected annotations
+    const list = await rpc(1, 'tools/list');
+    assert.equal(list.result.tools.length, 12);
+    const byName = new Map<string, any>(list.result.tools.map((t: any) => [t.name, t]));
+    for (const ro of MCP_TOOLS) {
+      assert.equal(byName.get(ro.name).annotations.readOnlyHint, true);
+      assert.equal(byName.get(ro.name).annotations.destructiveHint, false);
+    }
+    for (const nonDest of ['woc_click', 'woc_scroll', 'woc_draft_reply']) {
+      assert.equal(byName.get(nonDest).annotations.readOnlyHint, false);
+      assert.equal(byName.get(nonDest).annotations.destructiveHint, false);
+      assert.equal(byName.get(nonDest).annotations.idempotentHint, false);
+    }
+    assert.equal(byName.get('woc_confirm_send').annotations.readOnlyHint, false);
+    assert.equal(byName.get('woc_confirm_send').annotations.destructiveHint, true);
+    assert.equal(byName.get('woc_confirm_send').annotations.idempotentHint, false);
+    assert.equal(byName.get('woc_discard_draft').annotations.readOnlyHint, false);
+    assert.equal(byName.get('woc_discard_draft').annotations.destructiveHint, false);
+    assert.equal(byName.get('woc_discard_draft').annotations.idempotentHint, true);
+
+    // 2. woc_click: happy path, send_button_click_blocked, display_size_mismatch, out-of-bounds
+    const clickOk = await rpc(2, 'tools/call', {
+      name: 'woc_click',
+      arguments: { instance_id: RUNNING_INST.id, x: 500, y: 300, display_width: 1836, display_height: 884, button: 'right', double_click: true },
+    });
+    assert.equal(JSON.parse(clickOk.result.content[0].text).ok, true);
+    assert.equal(clicks.length, 1);
+    assert.equal(clicks[0].button, 'right');
+    assert.equal(clicks[0].doubleClick, true);
+
+    const clickSendBlocked = await rpc(201, 'tools/call', {
+      name: 'woc_click',
+      arguments: { instance_id: RUNNING_INST.id, x: 1750, y: 850, display_width: 1836, display_height: 884 },
+    });
+    assert.equal(JSON.parse(clickSendBlocked.result.content[0].text).error, 'send_button_click_blocked');
+    assert.equal(clicks.length, 1);
+
+    const clickMismatch = await rpc(3, 'tools/call', {
+      name: 'woc_click',
+      arguments: { instance_id: RUNNING_INST.id, x: 500, y: 300, display_width: 1280, display_height: 720 },
+    });
+    const clickMismatchBody = JSON.parse(clickMismatch.result.content[0].text);
+    assert.equal(clickMismatchBody.error, 'display_size_mismatch');
+    assert.equal(clickMismatchBody.actual_display_width, 1836);
+    assert.equal(clicks.length, 1);
+
+    const clickOob = await rpc(4, 'tools/call', {
+      name: 'woc_click',
+      arguments: { instance_id: RUNNING_INST.id, x: 1836, y: 100, display_width: 1836, display_height: 884 },
+    });
+    assert.equal(JSON.parse(clickOob.result.content[0].text).error, 'coordinates_out_of_bounds');
+    assert.equal(clicks.length, 1);
+
+    // 3. woc_scroll: happy path, display_size_mismatch, out-of-bounds
+    const scrollOk = await rpc(5, 'tools/call', {
+      name: 'woc_scroll',
+      arguments: { instance_id: RUNNING_INST.id, x: 800, y: 400, display_width: 1836, display_height: 884, direction: 'down', clicks: 5 },
+    });
+    assert.equal(JSON.parse(scrollOk.result.content[0].text).ok, true);
+    assert.equal(scrolls.length, 1);
+    assert.equal(scrolls[0].direction, 'down');
+    assert.equal(scrolls[0].clicks, 5);
+
+    const scrollMismatch = await rpc(6, 'tools/call', {
+      name: 'woc_scroll',
+      arguments: { instance_id: RUNNING_INST.id, x: 800, y: 400, display_width: 1000, display_height: 600, direction: 'up' },
+    });
+    assert.equal(JSON.parse(scrollMismatch.result.content[0].text).error, 'display_size_mismatch');
+
+    const scrollOob = await rpc(7, 'tools/call', {
+      name: 'woc_scroll',
+      arguments: { instance_id: RUNNING_INST.id, x: -5, y: 400, display_width: 1836, display_height: 884, direction: 'up' },
+    });
+    assert.equal(JSON.parse(scrollOob.result.content[0].text).error, 'coordinates_out_of_bounds');
+
+    // 4. human_in_control guard (both controlHolders AND activeVncViewerCount > 0)
+    controlActive = true;
+    const lockBlocked = await rpc(8, 'tools/call', {
+      name: 'woc_click',
+      arguments: { instance_id: RUNNING_INST.id, x: 100, y: 100, display_width: 1836, display_height: 884 },
+    });
+    assert.equal(JSON.parse(lockBlocked.result.content[0].text).error, 'human_in_control');
+    controlActive = false;
+
+    viewers = 1;
+    const viewerBlocked = await rpc(9, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'SECRET_BLOCKED_TEXT' },
+    });
+    assert.equal(JSON.parse(viewerBlocked.result.content[0].text).error, 'human_in_control');
+    const discardBlocked = await rpc(901, 'tools/call', {
+      name: 'woc_discard_draft',
+      arguments: { instance_id: RUNNING_INST.id },
+    });
+    assert.equal(JSON.parse(discardBlocked.result.content[0].text).error, 'human_in_control');
+    assert.equal(typed.length, 0);
+    assert.equal(cleared.length, 0);
+    viewers = 0;
+
+    // 5. instance_stopped rejected on write tools without starting container
+    const stopClick = await rpc(10, 'tools/call', {
+      name: 'woc_click',
+      arguments: { instance_id: STOPPED_INST.id, x: 100, y: 100, display_width: 1836, display_height: 884 },
+    });
+    assert.equal(JSON.parse(stopClick.result.content[0].text).error, 'instance_stopped');
+
+    const stopDraft = await rpc(11, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: STOPPED_INST.id, text: 'hello' },
+    });
+    assert.equal(JSON.parse(stopDraft.result.content[0].text).error, 'instance_stopped');
+
+    const stopDiscard = await rpc(1101, 'tools/call', {
+      name: 'woc_discard_draft',
+      arguments: { instance_id: STOPPED_INST.id },
+    });
+    assert.equal(JSON.parse(stopDiscard.result.content[0].text).error, 'instance_stopped');
+
+    // 6. woc_draft_reply (clearFirst: true) + woc_confirm_send happy path + replay protection
+    const SECRET_MSG = 'PRIVATE_WECHAT_REPLY_DO_NOT_LOG_987654';
+    const draftRes = await rpc(12, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: SECRET_MSG },
+    });
+    assert.equal(draftRes.result.content.length, 2);
+    assert.equal(draftRes.result.content[0].type, 'image');
+    assert.equal(draftRes.result.content[0].mimeType, 'image/png');
+    const draftMeta = JSON.parse(draftRes.result.content[1].text);
+    assert.equal(draftMeta.ok, true);
+    assert.equal(draftMeta.text_length, SECRET_MSG.length);
+    assert.equal(draftMeta.ttl_sec, 60);
+    assert.ok(draftMeta.draft_id);
+    assert.ok(draftMeta.fingerprint_summary.header_dhash);
+    assert.ok(draftMeta.fingerprint_summary.editor_dhash);
+    assert.equal(typed.length, 1);
+    assert.deepEqual(typed[0].opts, { focusChat: true, clearFirst: true, send: false });
+
+    const confirmOk = await rpc(13, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: draftMeta.draft_id },
+    });
+    const confirmOkBody = JSON.parse(confirmOk.result.content[0].text);
+    assert.equal(confirmOkBody.sent, true);
+    assert.equal(confirmOkBody.header_check.match, true);
+    assert.equal(confirmOkBody.editor_check.match, true);
+    assert.deepEqual(keysSent, ['Return']);
+
+    // Replay same draft_id -> draft_not_found + input_may_have_residual_draft: true
+    const replay = await rpc(14, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: draftMeta.draft_id },
+    });
+    const replayBody = JSON.parse(replay.result.content[0].text);
+    assert.equal(replayBody.error, 'draft_not_found');
+    assert.equal(replayBody.input_may_have_residual_draft, true);
+    assert.equal(keysSent.length, 1);
+
+    // 6b. woc_click and woc_scroll invalidate pending drafts
+    const dClick = JSON.parse((await rpc(1401, 'tools/call', { name: 'woc_draft_reply', arguments: { instance_id: RUNNING_INST.id, text: 'inv-click' } })).result.content[1].text).draft_id;
+    const clickInvBody = JSON.parse((await rpc(1402, 'tools/call', { name: 'woc_click', arguments: { instance_id: RUNNING_INST.id, x: 500, y: 300, display_width: 1836, display_height: 884 } })).result.content[0].text);
+    assert.equal(clickInvBody.invalidated_drafts, 1);
+    assert.equal(JSON.parse((await rpc(1403, 'tools/call', { name: 'woc_confirm_send', arguments: { instance_id: RUNNING_INST.id, draft_id: dClick } })).result.content[0].text).error, 'draft_not_found');
+
+    const dScroll = JSON.parse((await rpc(1404, 'tools/call', { name: 'woc_draft_reply', arguments: { instance_id: RUNNING_INST.id, text: 'inv-scroll' } })).result.content[1].text).draft_id;
+    const scrollInvBody = JSON.parse((await rpc(1405, 'tools/call', { name: 'woc_scroll', arguments: { instance_id: RUNNING_INST.id, x: 500, y: 300, display_width: 1836, display_height: 884, direction: 'up' } })).result.content[0].text);
+    assert.equal(scrollInvBody.invalidated_drafts, 1);
+    assert.equal(JSON.parse((await rpc(1406, 'tools/call', { name: 'woc_confirm_send', arguments: { instance_id: RUNNING_INST.id, draft_id: dScroll } })).result.content[0].text).error, 'draft_not_found');
+
+    // 6c. woc_discard_draft invalidates pending drafts and clears input box
+    const dDiscard = JSON.parse((await rpc(1407, 'tools/call', { name: 'woc_draft_reply', arguments: { instance_id: RUNNING_INST.id, text: 'to-discard' } })).result.content[1].text).draft_id;
+    const discardOk = JSON.parse((await rpc(1408, 'tools/call', { name: 'woc_discard_draft', arguments: { instance_id: RUNNING_INST.id } })).result.content[0].text);
+    assert.equal(discardOk.ok, true);
+    assert.equal(discardOk.invalidated_drafts, 1);
+    assert.equal(discardOk.input_cleared, true);
+    assert.deepEqual(cleared, [RUNNING_INST.id]);
+    assert.equal(JSON.parse((await rpc(1409, 'tools/call', { name: 'woc_confirm_send', arguments: { instance_id: RUNNING_INST.id, draft_id: dDiscard } })).result.content[0].text).error, 'draft_not_found');
+
+    // 7. Draft expired -> draft_expired + input_may_have_residual_draft: true
+    const draftExpRes = await rpc(15, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'expiring' },
+    });
+    const expId = JSON.parse(draftExpRes.result.content[1].text).draft_id;
+    fakeNow += 61_000;
+    const confirmExp = await rpc(16, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: expId },
+    });
+    const confirmExpBody = JSON.parse(confirmExp.result.content[0].text);
+    assert.equal(confirmExpBody.error, 'draft_expired');
+    assert.equal(confirmExpBody.input_may_have_residual_draft, true);
+    assert.equal(keysSent.length, 1);
+
+    // 8. Wrong instance_id -> draft_instance_mismatch + consumes draft_id
+    const draftWrongRes = await rpc(17, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'wrong-inst' },
+    });
+    const wrongId = JSON.parse(draftWrongRes.result.content[1].text).draft_id;
+    const confirmWrongBody = JSON.parse((await rpc(18, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: STOPPED_INST.id, draft_id: wrongId },
+    })).result.content[0].text);
+    assert.equal(confirmWrongBody.error, 'draft_instance_mismatch');
+    assert.equal(confirmWrongBody.input_may_have_residual_draft, true);
+    const retryAfterWrong = await rpc(19, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: wrongId },
+    });
+    assert.equal(JSON.parse(retryAfterWrong.result.content[0].text).error, 'draft_not_found');
+
+    // 9. Session header fingerprint mismatch -> aborted, consumed, residual flag + metrics
+    const draftFpRes = await rpc(20, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'fp-check' },
+    });
+    const fpId = JSON.parse(draftFpRes.result.content[1].text).draft_id;
+    liveFingerprint = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 200, 140, 15) });
+    fakeNow += 5_000;
+    const confirmFpFail = JSON.parse((await rpc(21, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: fpId },
+    })).result.content[0].text);
+    assert.equal(confirmFpFail.error, 'session_fingerprint_mismatch');
+    assert.equal(confirmFpFail.input_may_have_residual_draft, true);
+    assert.equal(confirmFpFail.header_check.match, false);
+    assert.equal(keysSent.length, 1);
+
+    // 9b. Editor fingerprint mismatch while header matches -> editor_fingerprint_mismatch
+    liveFingerprint = makeTestFingerprint();
+    const draftEdRes = await rpc(2101, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'editor-check' },
+    });
+    const edId = JSON.parse(draftEdRes.result.content[1].text).draft_id;
+    liveFingerprint = makeTestFingerprint({ editorGray: makeGrayBitmap(250, 200, 150, 15) });
+    fakeNow += 5_000;
+    const confirmEdFail = JSON.parse((await rpc(2102, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: edId },
+    })).result.content[0].text);
+    assert.equal(confirmEdFail.error, 'editor_fingerprint_mismatch');
+    assert.equal(confirmEdFail.input_may_have_residual_draft, true);
+    assert.equal(confirmEdFail.header_check.match, true);
+    assert.equal(confirmEdFail.editor_check.match, false);
+    assert.equal(keysSent.length, 1);
+
+    // 10. Window geometry mismatch -> aborted & consumed
+    liveFingerprint = makeTestFingerprint();
+    fakeNow += 61_000; // reset confirm_send window before geo-check
+    const draftGeoRes = await rpc(23, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'geo-check' },
+    });
+    const geoId = JSON.parse(draftGeoRes.result.content[1].text).draft_id;
+    liveFingerprint = makeTestFingerprint({ displayWidth: 1600, displayHeight: 900, winW: 1600, winH: 900 });
+    fakeNow += 5_000;
+    const confirmGeoFail = JSON.parse((await rpc(24, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: geoId },
+    })).result.content[0].text);
+    assert.equal(confirmGeoFail.error, 'window_geometry_mismatch');
+    assert.equal(confirmGeoFail.input_may_have_residual_draft, true);
+    assert.equal(keysSent.length, 1);
+
+    // 11. Send error -> send_uncertain_no_retry, NO auto-retry, draft consumed, residual flag
+    liveFingerprint = makeTestFingerprint();
+    fakeNow += 61_000;
+    keyThrows = true;
+    const draftErrRes2 = await rpc(26, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'no-retry-2' },
+    });
+    const errId2 = JSON.parse(draftErrRes2.result.content[1].text).draft_id;
+    const confirmErr = await rpc(27, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: errId2 },
+    });
+    assert.equal(confirmErr.result.isError, true);
+    const confirmErrBody = JSON.parse(confirmErr.result.content[0].text);
+    assert.equal(confirmErrBody.error, 'send_uncertain_no_retry');
+    assert.equal(confirmErrBody.input_may_have_residual_draft, true);
+    assert.equal(keysSent.length, 2); // called strictly once for this send, zero auto-retry!
+    assert.equal(JSON.parse((await rpc(28, 'tools/call', { name: 'woc_confirm_send', arguments: { instance_id: RUNNING_INST.id, draft_id: errId2 } })).result.content[0].text).error, 'draft_not_found');
+    keyThrows = false;
+
+    // 12. Rate limiting: confirm_send min interval (3s) -> rate_limited + residual flag
+    const draftRate1 = await rpc(29, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'rate-1' },
+    });
+    const rateId1 = JSON.parse(draftRate1.result.content[1].text).draft_id;
+    fakeNow += 500;
+    const confirmRateBlocked = await rpc(30, 'tools/call', {
+      name: 'woc_confirm_send',
+      arguments: { instance_id: RUNNING_INST.id, draft_id: rateId1 },
+    });
+    const rateBody = JSON.parse(confirmRateBlocked.result.content[0].text);
+    assert.equal(rateBody.error, 'rate_limited');
+    assert.equal(rateBody.limit_scope, 'confirm_send');
+    assert.equal(rateBody.input_may_have_residual_draft, true);
+    assert.ok(rateBody.retry_after_ms > 0);
+
+    // 13. Privacy audit log verification: zero plaintext message, zero base64 PNG, zero token
+    const allLogs = srv.logs.join('\n');
+    assert.ok(allLogs.includes('[mcp-audit]'));
+    assert.ok(!allLogs.includes(SECRET_MSG));
+    assert.ok(!allLogs.includes('SECRET_BLOCKED_TEXT'));
+    assert.ok(!allLogs.includes(TEST_TOKEN));
+    assert.ok(!allLogs.includes(draftRes.result.content[0].data));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('Phase 2 general write rate limiter enforces per-minute window', async () => {
+  let fakeNow = 1_700_000_000_000;
+  const srv = await buildMockMcpServer({
+    allowWrite: true,
+    now: () => fakeNow,
+    rateLimits: { writeWindowMs: 60_000, writeMaxPerWindow: 2 },
+    activeVncViewerCount: () => 0,
+    getControlLock: () => ({ active: false, holder: null, ageMs: null }),
+    clickInInstance: async () => ({ displayWidth: 1836, displayHeight: 884 }),
+  });
+  const callClick = async (id: number) => {
+    const res = await rawHttp(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: {
+          name: 'woc_click',
+          arguments: { instance_id: RUNNING_INST.id, x: 100, y: 100, display_width: 1836, display_height: 884 },
+        },
+      }),
+    });
+    return JSON.parse(JSON.parse(res.body).result.content[0].text);
+  };
+  try {
+    assert.equal((await callClick(1)).ok, true);
+    assert.equal((await callClick(2)).ok, true);
+    const third = await callClick(3);
+    assert.equal(third.error, 'rate_limited');
+    assert.equal(third.limit_scope, 'write');
+    assert.ok(third.retry_after_ms > 0);
+    // Advance past window -> allowed again
+    fakeNow += 60_001;
+    assert.equal((await callClick(4)).ok, true);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('real panel boot: MCP_ALLOW_WRITE=1 exposes 12 tools including woc_confirm_send and woc_discard_draft', { timeout: 20000 }, async () => {
+  await withBootedPanel({ MCP_AUTH_TOKEN: TEST_TOKEN, MCP_ALLOW_WRITE: '1' }, async (url) => {
+    const listRes = await rawHttp(`${url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    assert.equal(listRes.status, 200);
+    assert.equal(listRes.headers['cache-control'], 'no-store, max-age=0');
+    const tools = JSON.parse(listRes.body).result.tools;
+    assert.equal(tools.length, 12);
+    const confirmTool = tools.find((t: any) => t.name === 'woc_confirm_send');
+    const discardTool = tools.find((t: any) => t.name === 'woc_discard_draft');
+    assert.ok(confirmTool);
+    assert.ok(discardTool);
+    assert.equal(confirmTool.annotations?.destructiveHint, true);
+    assert.equal(discardTool.annotations?.idempotentHint, true);
   });
 });

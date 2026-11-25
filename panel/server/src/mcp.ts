@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -8,14 +8,23 @@ import {
   publicInstance,
   type Instance,
 } from './store.js';
-import type {
-  RuntimeState,
-  ScreenshotCrop,
-  ScreenshotOptions,
-  ScreenshotResult,
-  TransferFile,
-  WechatStatus,
-  WechatWindowInfo,
+import {
+  compareSessionFingerprints,
+  DisplaySizeMismatchError,
+  isInSendButtonZone,
+  type ClickOptions,
+  type MouseButton,
+  type RuntimeState,
+  type ScreenshotCrop,
+  type ScreenshotOptions,
+  type ScreenshotResult,
+  type ScrollDirection,
+  type ScrollOptions,
+  type SessionFingerprint,
+  type TransferFile,
+  type TypeOptions,
+  type WechatStatus,
+  type WechatWindowInfo,
 } from './docker.js';
 import { DIAG_RANGES, filterSince, rangeToMs } from './logs.js';
 
@@ -26,6 +35,14 @@ const MAX_LOG_BYTES = 64 * 1024; // 64 KiB cap on returned log text
 const DEFAULT_SCREENSHOT_MAX_WIDTH = 1280;
 const MIN_SCREENSHOT_MAX_WIDTH = 320;
 const MAX_SCREENSHOT_MAX_WIDTH = 2560;
+const MAX_DRAFT_TEXT_CHARS = 500;
+const DEFAULT_DRAFT_TTL_MS = 60_000;
+const MAX_DRAFT_ENTRIES = 32;
+const DEFAULT_WRITE_WINDOW_MS = 60_000;
+const DEFAULT_WRITE_MAX_PER_WINDOW = 20;
+const DEFAULT_SEND_WINDOW_MS = 60_000;
+const DEFAULT_SEND_MAX_PER_WINDOW = 3;
+const DEFAULT_SEND_MIN_INTERVAL_MS = 3_000;
 
 export interface ControlLockInfo {
   active: boolean;
@@ -33,8 +50,17 @@ export interface ControlLockInfo {
   ageMs: number | null;
 }
 
+export interface WriteRateLimitConfig {
+  writeWindowMs?: number;
+  writeMaxPerWindow?: number;
+  sendWindowMs?: number;
+  sendMaxPerWindow?: number;
+  sendMinIntervalMs?: number;
+}
+
 export interface McpDeps {
   authToken?: string;
+  allowWrite?: boolean;
   allowedHosts: string[];
   panelVersion: string;
   buildRevision: string | null;
@@ -51,10 +77,19 @@ export interface McpDeps {
   listInstanceFiles: (inst: Instance) => Promise<TransferFile[]>;
   wechatWindowInfo: (inst: Instance) => Promise<WechatWindowInfo>;
   captureInstanceScreenshot: (inst: Instance, opts?: ScreenshotOptions) => Promise<ScreenshotResult>;
+  clickInInstance?: (inst: Instance, opts: ClickOptions) => Promise<{ displayWidth: number; displayHeight: number }>;
+  scrollInInstance?: (inst: Instance, opts: ScrollOptions) => Promise<{ displayWidth: number; displayHeight: number }>;
+  typeInInstance?: (inst: Instance, text: string, opts?: TypeOptions) => Promise<void>;
+  clearInputInInstance?: (inst: Instance) => Promise<void>;
+  keyInInstance?: (inst: Instance, key: string) => Promise<void>;
+  captureSessionFingerprint?: (inst: Instance) => Promise<SessionFingerprint>;
   effectiveLimits: (inst: Instance) => { soft: number; hard: number };
   activeVncViewerCount: (id: string) => number;
   getControlLock: (id: string) => ControlLockInfo;
   hasActiveSession: (id: string) => boolean;
+  draftTtlMs?: number;
+  rateLimits?: WriteRateLimitConfig;
+  now?: () => number;
   log?: (line: string) => void;
 }
 
@@ -62,6 +97,27 @@ const READ_ONLY_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,
   idempotentHint: true,
+  openWorldHint: false,
+} as const;
+
+const WRITE_NON_DESTRUCTIVE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+} as const;
+
+const WRITE_IDEMPOTENT_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
+
+const WRITE_DESTRUCTIVE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
   openWorldHint: false,
 } as const;
 
@@ -212,6 +268,303 @@ export const MCP_TOOLS: Tool[] = [
   },
 ];
 
+export const MCP_WRITE_TOOLS: Tool[] = [
+  {
+    name: 'woc_click',
+    description:
+      'Click at native X11 display coordinates (NOT scaled screenshot coordinates) inside a running WOC instance. Rejects if live display dimensions do not match display_width/display_height, if a human is viewing/controlling VNC, or if stopped. Clicking WeChat bottom-right Send button to bypass woc_draft_reply + woc_confirm_send is prohibited and blocked (send_button_click_blocked). Invalidates any pending drafts for this instance.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instance_id: {
+          type: 'string',
+          description: 'Instance ID (from woc_list_instances).',
+        },
+        x: {
+          type: 'number',
+          description: 'Target X coordinate in native X11 display pixels.',
+        },
+        y: {
+          type: 'number',
+          description: 'Target Y coordinate in native X11 display pixels.',
+        },
+        display_width: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Expected live X11 display width (must match current display).',
+        },
+        display_height: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Expected live X11 display height (must match current display).',
+        },
+        button: {
+          type: 'string',
+          enum: ['left', 'right', 'middle'],
+          description: 'Mouse button to click (default left).',
+        },
+        double_click: {
+          type: 'boolean',
+          description: 'Perform a double click when true (default false).',
+        },
+      },
+      required: ['instance_id', 'x', 'y', 'display_width', 'display_height'],
+      additionalProperties: false,
+    },
+    annotations: WRITE_NON_DESTRUCTIVE_ANNOTATIONS,
+  },
+  {
+    name: 'woc_scroll',
+    description:
+      'Scroll at native X11 display coordinates inside a running WOC instance. Rejects if live display dimensions do not match display_width/display_height, if a human is viewing/controlling VNC, or if stopped. Invalidates any pending drafts for this instance.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instance_id: {
+          type: 'string',
+          description: 'Instance ID (from woc_list_instances).',
+        },
+        x: {
+          type: 'number',
+          description: 'Pointer X coordinate in native X11 display pixels.',
+        },
+        y: {
+          type: 'number',
+          description: 'Pointer Y coordinate in native X11 display pixels.',
+        },
+        display_width: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Expected live X11 display width (must match current display).',
+        },
+        display_height: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Expected live X11 display height (must match current display).',
+        },
+        direction: {
+          type: 'string',
+          enum: ['up', 'down', 'left', 'right'],
+          description: 'Scroll direction.',
+        },
+        clicks: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 20,
+          description: 'Number of wheel steps (1..20, default 3).',
+        },
+      },
+      required: ['instance_id', 'x', 'y', 'display_width', 'display_height', 'direction'],
+      additionalProperties: false,
+    },
+    annotations: WRITE_NON_DESTRUCTIVE_ANNOTATIONS,
+  },
+  {
+    name: 'woc_draft_reply',
+    description:
+      'Clear any residual text in the active WeChat chat editor and paste draft reply text (focusChat=true, clearFirst=true, NEVER presses Return), capture an atomic header+editor grayscale fingerprint and post-paste verification screenshot, and return a short-lived single-use draft_id for woc_confirm_send.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instance_id: {
+          type: 'string',
+          description: 'Instance ID (from woc_list_instances).',
+        },
+        text: {
+          type: 'string',
+          minLength: 1,
+          maxLength: MAX_DRAFT_TEXT_CHARS,
+          description: `Draft message text to paste into WeChat editor (1..${MAX_DRAFT_TEXT_CHARS} chars; clears existing input first, never sent automatically).`,
+        },
+        max_width: {
+          type: 'integer',
+          minimum: 0,
+          maximum: MAX_SCREENSHOT_MAX_WIDTH,
+          description: `Target max width for the post-paste verification screenshot (default ${DEFAULT_SCREENSHOT_MAX_WIDTH}; 0 for native; or ${MIN_SCREENSHOT_MAX_WIDTH}-${MAX_SCREENSHOT_MAX_WIDTH}).`,
+        },
+        full_resolution: {
+          type: 'boolean',
+          description: 'Capture post-paste verification screenshot at full native width.',
+        },
+      },
+      required: ['instance_id', 'text'],
+      additionalProperties: false,
+    },
+    annotations: WRITE_NON_DESTRUCTIVE_ANNOTATIONS,
+  },
+  {
+    name: 'woc_confirm_send',
+    description:
+      'Consume a single-use draft_id from woc_draft_reply, re-verify runtime/human-control/window geometry/header+editor fingerprints, and press Return once to send the drafted WeChat reply. Never retries on error and never re-pastes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instance_id: {
+          type: 'string',
+          description: 'Instance ID matching the draft.',
+        },
+        draft_id: {
+          type: 'string',
+          description: 'Single-use draft_id returned by woc_draft_reply.',
+        },
+      },
+      required: ['instance_id', 'draft_id'],
+      additionalProperties: false,
+    },
+    annotations: WRITE_DESTRUCTIVE_ANNOTATIONS,
+  },
+  {
+    name: 'woc_discard_draft',
+    description:
+      'Invalidate all pending unconsumed draft_ids for an instance and clear any residual text in the active WeChat chat input box (ctrl+a + BackSpace, never presses Return).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instance_id: {
+          type: 'string',
+          description: 'Instance ID whose pending drafts and chat input box should be cleared.',
+        },
+      },
+      required: ['instance_id'],
+      additionalProperties: false,
+    },
+    annotations: WRITE_IDEMPOTENT_ANNOTATIONS,
+  },
+];
+
+// ---------- Bounded In-Memory Draft Store (NEVER stores message plaintext) ----------
+interface DraftEntry {
+  draftId: string;
+  instanceId: string;
+  createdAt: number;
+  expiresAt: number;
+  textLength: number;
+  fingerprint: SessionFingerprint;
+}
+
+class DraftStore {
+  private readonly entries = new Map<string, DraftEntry>();
+  private readonly ttlMs: number;
+  private readonly maxEntries: number;
+  private readonly now: () => number;
+
+  constructor(opts: { ttlMs?: number; maxEntries?: number; now?: () => number } = {}) {
+    this.ttlMs = opts.ttlMs ?? DEFAULT_DRAFT_TTL_MS;
+    this.maxEntries = opts.maxEntries ?? MAX_DRAFT_ENTRIES;
+    this.now = opts.now ?? (() => Date.now());
+  }
+
+  private prune(ts: number): void {
+    for (const [id, entry] of this.entries) {
+      if (ts > entry.expiresAt) this.entries.delete(id);
+    }
+  }
+
+  create(instanceId: string, textLength: number, fingerprint: SessionFingerprint): DraftEntry {
+    const ts = this.now();
+    this.prune(ts);
+    while (this.entries.size >= this.maxEntries) {
+      const oldestKey = this.entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.entries.delete(oldestKey);
+    }
+    const draftId = randomBytes(16).toString('hex');
+    const entry: DraftEntry = {
+      draftId,
+      instanceId,
+      createdAt: ts,
+      expiresAt: ts + this.ttlMs,
+      textLength,
+      fingerprint,
+    };
+    this.entries.set(draftId, entry);
+    return entry;
+  }
+
+  // Atomically look up and delete so draft_id can NEVER be reused even on mismatch/failure.
+  consume(draftId: string): DraftEntry | null {
+    const entry = this.entries.get(draftId) ?? null;
+    if (entry) this.entries.delete(draftId);
+    return entry;
+  }
+
+  // Invalidate all unconsumed drafts for a specific instance (called after click/scroll/discard).
+  invalidateInstance(instanceId: string): number {
+    let count = 0;
+    for (const [id, entry] of this.entries) {
+      if (entry.instanceId === instanceId) {
+        this.entries.delete(id);
+        count++;
+      }
+    }
+    return count;
+  }
+}
+
+// ---------- Sliding-Window Write Rate Limiter ----------
+class WriteRateLimiter {
+  private readonly writeHits: number[] = [];
+  private readonly sendHits: number[] = [];
+  private readonly writeWindowMs: number;
+  private readonly writeMax: number;
+  private readonly sendWindowMs: number;
+  private readonly sendMax: number;
+  private readonly sendMinIntervalMs: number;
+  private readonly now: () => number;
+
+  constructor(cfg: WriteRateLimitConfig = {}, now: () => number = () => Date.now()) {
+    this.writeWindowMs = cfg.writeWindowMs ?? DEFAULT_WRITE_WINDOW_MS;
+    this.writeMax = cfg.writeMaxPerWindow ?? DEFAULT_WRITE_MAX_PER_WINDOW;
+    this.sendWindowMs = cfg.sendWindowMs ?? DEFAULT_SEND_WINDOW_MS;
+    this.sendMax = cfg.sendMaxPerWindow ?? DEFAULT_SEND_MAX_PER_WINDOW;
+    this.sendMinIntervalMs = cfg.sendMinIntervalMs ?? DEFAULT_SEND_MIN_INTERVAL_MS;
+    this.now = now;
+  }
+
+  private prune(arr: number[], windowMs: number, ts: number): void {
+    const cutoff = ts - windowMs;
+    while (arr.length > 0 && arr[0] <= cutoff) arr.shift();
+  }
+
+  checkAndRecord(isConfirmSend: boolean): { allowed: true } | { allowed: false; retryAfterMs: number; scope: 'write' | 'confirm_send' } {
+    const ts = this.now();
+    this.prune(this.writeHits, this.writeWindowMs, ts);
+    this.prune(this.sendHits, this.sendWindowMs, ts);
+
+    if (isConfirmSend) {
+      if (this.sendHits.length > 0) {
+        const elapsed = ts - this.sendHits[this.sendHits.length - 1];
+        if (elapsed < this.sendMinIntervalMs) {
+          return {
+            allowed: false,
+            retryAfterMs: Math.max(1, this.sendMinIntervalMs - elapsed),
+            scope: 'confirm_send',
+          };
+        }
+      }
+      if (this.sendHits.length >= this.sendMax) {
+        return {
+          allowed: false,
+          retryAfterMs: Math.max(1, this.sendHits[0] + this.sendWindowMs - ts),
+          scope: 'confirm_send',
+        };
+      }
+    }
+
+    if (this.writeHits.length >= this.writeMax) {
+      return {
+        allowed: false,
+        retryAfterMs: Math.max(1, this.writeHits[0] + this.writeWindowMs - ts),
+        scope: 'write',
+      };
+    }
+
+    this.writeHits.push(ts);
+    if (isConfirmSend) this.sendHits.push(ts);
+    return { allowed: true };
+  }
+}
+
 // Constant-time, length-safe Bearer token verification using SHA-256 digests.
 export function verifyBearerToken(authHeader: string | undefined, expectedToken: string): boolean {
   if (!authHeader || !expectedToken) return false;
@@ -253,6 +606,22 @@ function requireInstanceId(args: Record<string, unknown>): string {
   return id.trim();
 }
 
+function requireFiniteNumber(args: Record<string, unknown>, key: string): number {
+  const v = args[key];
+  if (typeof v !== 'number' || !Number.isFinite(v)) {
+    throw new Error(`invalid_argument: ${key} must be a finite number`);
+  }
+  return v;
+}
+
+function requirePositiveInt(args: Record<string, unknown>, key: string): number {
+  const v = args[key];
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 1) {
+    throw new Error(`invalid_argument: ${key} must be a positive integer`);
+  }
+  return v;
+}
+
 function truncateTailBytes(text: string, maxBytes: number): { text: string; truncated: boolean } {
   const buf = Buffer.from(text, 'utf8');
   if (buf.length <= maxBytes) return { text, truncated: false };
@@ -264,7 +633,7 @@ function truncateTailBytes(text: string, maxBytes: number): { text: string; trun
   return { text: slice.toString('utf8'), truncated: true };
 }
 
-function parseScreenshotArgs(args: Record<string, unknown>): ScreenshotOptions {
+function parseScreenshotArgs(args: Record<string, unknown>, allowCrop = true): ScreenshotOptions {
   const fullResolution = args.full_resolution === true;
   let maxWidth = DEFAULT_SCREENSHOT_MAX_WIDTH;
   if (fullResolution) {
@@ -285,7 +654,7 @@ function parseScreenshotArgs(args: Record<string, unknown>): ScreenshotOptions {
   }
 
   let crop: ScreenshotCrop | undefined;
-  if (args.crop !== undefined) {
+  if (allowCrop && args.crop !== undefined) {
     if (!args.crop || typeof args.crop !== 'object' || Array.isArray(args.crop)) {
       throw new Error('invalid_argument: crop must be an object { x, y, width, height }');
     }
@@ -304,8 +673,88 @@ function parseScreenshotArgs(args: Record<string, unknown>): ScreenshotOptions {
   return { maxWidth, crop };
 }
 
-function createMcpServer(deps: McpDeps): Server {
+interface McpRuntimeState {
+  allowWrite: boolean;
+  draftStore: DraftStore;
+  rateLimiter: WriteRateLimiter;
+  now: () => number;
+}
+
+function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
   const log = deps.log ?? ((line: string) => console.log(line));
+  const activeTools = state.allowWrite ? [...MCP_TOOLS, ...MCP_WRITE_TOOLS] : MCP_TOOLS;
+
+  const auditWrite = (entry: {
+    tool: string;
+    instance_id: string;
+    text_length?: number;
+    result: 'ok' | 'rejected' | 'error';
+    error?: string;
+    duration_ms: number;
+  }) => {
+    // Privacy: NEVER log message plaintext, screenshots/base64, or tokens.
+    log(`[mcp-audit] ${JSON.stringify({ ts: new Date(state.now()).toISOString(), ...entry })}`);
+  };
+
+  // Shared pre-execution guardrail for all 4 write tools.
+  const checkWriteGuards = async (
+    inst: Instance,
+    isConfirmSend: boolean,
+  ): Promise<
+    | { ok: true }
+    | { ok: false; error: string; payload: Record<string, unknown> }
+  > => {
+    const runtime = await deps.instanceRuntime(inst);
+    if (runtime !== 'running') {
+      return {
+        ok: false,
+        error: 'instance_stopped',
+        payload: {
+          ok: false,
+          error: 'instance_stopped',
+          instance_id: inst.id,
+          runtime,
+          message: 'Instance is not running; MCP will not start stopped containers.',
+        },
+      };
+    }
+
+    const viewers = deps.activeVncViewerCount(inst.id);
+    const controlLock = deps.getControlLock(inst.id);
+    if (viewers > 0 || controlLock.active) {
+      return {
+        ok: false,
+        error: 'human_in_control',
+        payload: {
+          ok: false,
+          error: 'human_in_control',
+          instance_id: inst.id,
+          active_vnc_viewers: viewers,
+          control_lock: controlLock,
+          message: 'A human is currently viewing or controlling this instance; write action aborted.',
+        },
+      };
+    }
+
+    const rate = state.rateLimiter.checkAndRecord(isConfirmSend);
+    if (!rate.allowed) {
+      return {
+        ok: false,
+        error: 'rate_limited',
+        payload: {
+          ok: false,
+          error: 'rate_limited',
+          instance_id: inst.id,
+          limit_scope: rate.scope,
+          retry_after_ms: rate.retryAfterMs,
+          message: `Write rate limit exceeded (${rate.scope}); retry after ${rate.retryAfterMs}ms.`,
+        },
+      };
+    }
+
+    return { ok: true };
+  };
+
   const server = new Server(
     {
       name: 'woc-panel-mcp',
@@ -315,13 +764,14 @@ function createMcpServer(deps: McpDeps): Server {
       capabilities: {
         tools: {},
       },
-      instructions:
-        'Read-only MCP server for WechatOnCloud (WOC). Never assumes stopped instances can be started; check runtime state first.',
+      instructions: state.allowWrite
+        ? 'MCP server for WechatOnCloud (WOC) with controlled write tools enabled. Never assumes stopped instances can be started. Always inspect screenshot/window info before clicking; always review woc_draft_reply screenshot and obtain explicit user approval before calling woc_confirm_send.'
+        : 'Read-only MCP server for WechatOnCloud (WOC). Never assumes stopped instances can be started; check runtime state first.',
     },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: MCP_TOOLS,
+    tools: activeTools,
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -331,8 +781,20 @@ function createMcpServer(deps: McpDeps): Server {
       rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
         ? (rawArgs as Record<string, unknown>)
         : {};
-    const t0 = Date.now();
+    const t0 = state.now();
     let logInstanceId = '-';
+    const isWriteTool =
+      toolName === 'woc_click' ||
+      toolName === 'woc_scroll' ||
+      toolName === 'woc_draft_reply' ||
+      toolName === 'woc_confirm_send' ||
+      toolName === 'woc_discard_draft';
+
+    // Strict feature gate: when MCP_ALLOW_WRITE !== '1', write tools behave as unknown tools.
+    if (isWriteTool && !state.allowWrite) {
+      log(`[mcp] tool=${toolName} instanceId=- durationMs=${state.now() - t0} ok=false reason=unknown_tool`);
+      return jsonTextResult({ ok: false, error: 'unknown_tool', tool: toolName }, true);
+    }
 
     try {
       switch (toolName) {
@@ -354,7 +816,7 @@ function createMcpServer(deps: McpDeps): Server {
             socket_proxy_ok: socketProxyOk,
             instances: counts,
           };
-          log(`[mcp] tool=${toolName} instanceId=- durationMs=${Date.now() - t0} ok=true`);
+          log(`[mcp] tool=${toolName} instanceId=- durationMs=${state.now() - t0} ok=true`);
           return jsonTextResult(payload);
         }
 
@@ -378,7 +840,7 @@ function createMcpServer(deps: McpDeps): Server {
               };
             }),
           );
-          log(`[mcp] tool=${toolName} instanceId=- count=${out.length} durationMs=${Date.now() - t0} ok=true`);
+          log(`[mcp] tool=${toolName} instanceId=- count=${out.length} durationMs=${state.now() - t0} ok=true`);
           return jsonTextResult({ ok: true, instances: out });
         }
 
@@ -387,7 +849,7 @@ function createMcpServer(deps: McpDeps): Server {
           logInstanceId = id;
           const inst = deps.findInstance(id);
           if (!inst) {
-            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${Date.now() - t0} ok=false reason=not_found`);
+            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${state.now() - t0} ok=false reason=not_found`);
             return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
           }
           const runtime = await deps.instanceRuntime(inst);
@@ -410,9 +872,9 @@ function createMcpServer(deps: McpDeps): Server {
               active_vnc_viewers: viewers,
               control_lock: controlLock,
               has_active_session: activeSession,
-              message: 'Instance is not running; read-only MCP does not start stopped containers.',
+              message: 'Instance is not running; MCP does not start stopped containers.',
             };
-            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${Date.now() - t0} ok=true`);
+            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${state.now() - t0} ok=true`);
             return jsonTextResult(payload);
           }
 
@@ -436,7 +898,7 @@ function createMcpServer(deps: McpDeps): Server {
             control_lock: controlLock,
             has_active_session: activeSession,
           };
-          log(`[mcp] tool=${toolName} instanceId=${id} runtime=running durationMs=${Date.now() - t0} ok=true`);
+          log(`[mcp] tool=${toolName} instanceId=${id} runtime=running durationMs=${state.now() - t0} ok=true`);
           return jsonTextResult(payload);
         }
 
@@ -445,7 +907,7 @@ function createMcpServer(deps: McpDeps): Server {
           logInstanceId = id;
           const inst = deps.findInstance(id);
           if (!inst) {
-            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${Date.now() - t0} ok=false reason=not_found`);
+            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${state.now() - t0} ok=false reason=not_found`);
             return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
           }
           let tail = DEFAULT_LOG_TAIL;
@@ -474,7 +936,7 @@ function createMcpServer(deps: McpDeps): Server {
           let history: string | undefined;
           let historyTruncated: boolean | undefined;
           if (includeHistory) {
-            const since = Date.now() - rangeToMs(range);
+            const since = state.now() - rangeToMs(range);
             const filtered = filterSince(deps.readInstanceLog(inst.id), since).trimEnd();
             const capped = truncateTailBytes(filtered, MAX_LOG_BYTES);
             history = capped.text;
@@ -491,7 +953,7 @@ function createMcpServer(deps: McpDeps): Server {
             live_truncated: liveTruncated,
             ...(includeHistory ? { range, history, history_truncated: historyTruncated } : {}),
           };
-          log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} tail=${tail} durationMs=${Date.now() - t0} ok=true`);
+          log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} tail=${tail} durationMs=${state.now() - t0} ok=true`);
           return jsonTextResult(payload);
         }
 
@@ -500,12 +962,12 @@ function createMcpServer(deps: McpDeps): Server {
           logInstanceId = id;
           const inst = deps.findInstance(id);
           if (!inst) {
-            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${Date.now() - t0} ok=false reason=not_found`);
+            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${state.now() - t0} ok=false reason=not_found`);
             return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
           }
           const runtime = await deps.instanceRuntime(inst);
           if (runtime !== 'running') {
-            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${Date.now() - t0} ok=false reason=instance_stopped`);
+            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${state.now() - t0} ok=false reason=instance_stopped`);
             return jsonTextResult({
               ok: false,
               error: 'instance_stopped',
@@ -515,7 +977,7 @@ function createMcpServer(deps: McpDeps): Server {
             });
           }
           const files = await deps.listInstanceFiles(inst);
-          log(`[mcp] tool=${toolName} instanceId=${id} files=${files.length} durationMs=${Date.now() - t0} ok=true`);
+          log(`[mcp] tool=${toolName} instanceId=${id} files=${files.length} durationMs=${state.now() - t0} ok=true`);
           return jsonTextResult({
             ok: true,
             instance_id: inst.id,
@@ -529,12 +991,12 @@ function createMcpServer(deps: McpDeps): Server {
           logInstanceId = id;
           const inst = deps.findInstance(id);
           if (!inst) {
-            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${Date.now() - t0} ok=false reason=not_found`);
+            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${state.now() - t0} ok=false reason=not_found`);
             return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
           }
           const runtime = await deps.instanceRuntime(inst);
           if (runtime !== 'running') {
-            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${Date.now() - t0} ok=false reason=instance_stopped`);
+            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${state.now() - t0} ok=false reason=instance_stopped`);
             return jsonTextResult({
               ok: false,
               error: 'instance_stopped',
@@ -545,7 +1007,7 @@ function createMcpServer(deps: McpDeps): Server {
           }
           const info = await deps.wechatWindowInfo(inst);
           log(
-            `[mcp] tool=${toolName} instanceId=${id} display=${info.displayWidth}x${info.displayHeight} hasWechat=${Boolean(info.wechatWindow)} durationMs=${Date.now() - t0} ok=true`,
+            `[mcp] tool=${toolName} instanceId=${id} display=${info.displayWidth}x${info.displayHeight} hasWechat=${Boolean(info.wechatWindow)} durationMs=${state.now() - t0} ok=true`,
           );
           return jsonTextResult({
             ok: true,
@@ -562,12 +1024,12 @@ function createMcpServer(deps: McpDeps): Server {
           const opts = parseScreenshotArgs(args);
           const inst = deps.findInstance(id);
           if (!inst) {
-            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${Date.now() - t0} ok=false reason=not_found`);
+            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${state.now() - t0} ok=false reason=not_found`);
             return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
           }
           const runtime = await deps.instanceRuntime(inst);
           if (runtime !== 'running') {
-            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${Date.now() - t0} ok=false reason=instance_stopped`);
+            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${state.now() - t0} ok=false reason=instance_stopped`);
             return jsonTextResult({
               ok: false,
               error: 'instance_stopped',
@@ -610,13 +1072,447 @@ function createMcpServer(deps: McpDeps): Server {
           };
         }
 
+        // ---------- Phase 2 Controlled Write Tools (gated by MCP_ALLOW_WRITE=1) ----------
+        case 'woc_click': {
+          const id = requireInstanceId(args);
+          logInstanceId = id;
+          const x = Math.round(requireFiniteNumber(args, 'x'));
+          const y = Math.round(requireFiniteNumber(args, 'y'));
+          const displayWidth = requirePositiveInt(args, 'display_width');
+          const displayHeight = requirePositiveInt(args, 'display_height');
+          const buttonRaw = args.button === undefined ? 'left' : args.button;
+          if (buttonRaw !== 'left' && buttonRaw !== 'right' && buttonRaw !== 'middle') {
+            throw new Error('invalid_argument: button must be left, right, or middle');
+          }
+          const button: MouseButton = buttonRaw;
+          const doubleClick = args.double_click === true;
+
+          const inst = deps.findInstance(id);
+          if (!inst) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'instance_not_found', duration_ms: state.now() - t0 });
+            return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
+          }
+
+          if (x < 0 || x >= displayWidth || y < 0 || y >= displayHeight) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'coordinates_out_of_bounds', duration_ms: state.now() - t0 });
+            return jsonTextResult(
+              {
+                ok: false,
+                error: 'coordinates_out_of_bounds',
+                instance_id: id,
+                x,
+                y,
+                display_width: displayWidth,
+                display_height: displayHeight,
+              },
+              true,
+            );
+          }
+
+          const guard = await checkWriteGuards(inst, false);
+          if (!guard.ok) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: guard.error, duration_ms: state.now() - t0 });
+            return jsonTextResult(guard.payload);
+          }
+
+          // Re-verify live display dimensions before clicking.
+          const liveWin = await deps.wechatWindowInfo(inst);
+          if (liveWin.displayWidth !== displayWidth || liveWin.displayHeight !== displayHeight) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'display_size_mismatch', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: false,
+              error: 'display_size_mismatch',
+              instance_id: id,
+              expected_display_width: displayWidth,
+              expected_display_height: displayHeight,
+              actual_display_width: liveWin.displayWidth,
+              actual_display_height: liveWin.displayHeight,
+            });
+          }
+
+          // Low-cost guard: block clicks inside WeChat's bottom-right Send button zone.
+          if (isInSendButtonZone(x, y, liveWin.wechatWindow)) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'send_button_click_blocked', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: false,
+              error: 'send_button_click_blocked',
+              instance_id: id,
+              x,
+              y,
+              message:
+                'Clicking inside WeChat bottom-right Send button zone is blocked by woc_click; use woc_draft_reply followed by woc_confirm_send.',
+            });
+          }
+
+          if (!deps.clickInInstance) throw new Error('clickInInstance handler not configured');
+          try {
+            const actual = await deps.clickInInstance(inst, {
+              x,
+              y,
+              displayWidth,
+              displayHeight,
+              button,
+              doubleClick,
+            });
+            const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
+            auditWrite({ tool: toolName, instance_id: id, result: 'ok', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: true,
+              instance_id: id,
+              x,
+              y,
+              button,
+              double_click: doubleClick,
+              display_width: actual.displayWidth,
+              display_height: actual.displayHeight,
+              invalidated_drafts: invalidatedDrafts,
+            });
+          } catch (e: any) {
+            if (e instanceof DisplaySizeMismatchError) {
+              auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'display_size_mismatch', duration_ms: state.now() - t0 });
+              return jsonTextResult({
+                ok: false,
+                error: 'display_size_mismatch',
+                instance_id: id,
+                expected_display_width: e.expectedWidth,
+                expected_display_height: e.expectedHeight,
+                actual_display_width: e.actualWidth,
+                actual_display_height: e.actualHeight,
+              });
+            }
+            throw e;
+          }
+        }
+
+        case 'woc_scroll': {
+          const id = requireInstanceId(args);
+          logInstanceId = id;
+          const x = Math.round(requireFiniteNumber(args, 'x'));
+          const y = Math.round(requireFiniteNumber(args, 'y'));
+          const displayWidth = requirePositiveInt(args, 'display_width');
+          const displayHeight = requirePositiveInt(args, 'display_height');
+          const dirRaw = args.direction;
+          if (dirRaw !== 'up' && dirRaw !== 'down' && dirRaw !== 'left' && dirRaw !== 'right') {
+            throw new Error('invalid_argument: direction must be up, down, left, or right');
+          }
+          const direction: ScrollDirection = dirRaw;
+          let clicks = 3;
+          if (args.clicks !== undefined) {
+            if (typeof args.clicks !== 'number' || !Number.isInteger(args.clicks) || args.clicks < 1 || args.clicks > 20) {
+              throw new Error('invalid_argument: clicks must be an integer between 1 and 20');
+            }
+            clicks = args.clicks;
+          }
+
+          const inst = deps.findInstance(id);
+          if (!inst) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'instance_not_found', duration_ms: state.now() - t0 });
+            return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
+          }
+
+          if (x < 0 || x >= displayWidth || y < 0 || y >= displayHeight) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'coordinates_out_of_bounds', duration_ms: state.now() - t0 });
+            return jsonTextResult(
+              {
+                ok: false,
+                error: 'coordinates_out_of_bounds',
+                instance_id: id,
+                x,
+                y,
+                display_width: displayWidth,
+                display_height: displayHeight,
+              },
+              true,
+            );
+          }
+
+          const guard = await checkWriteGuards(inst, false);
+          if (!guard.ok) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: guard.error, duration_ms: state.now() - t0 });
+            return jsonTextResult(guard.payload);
+          }
+
+          const liveWin = await deps.wechatWindowInfo(inst);
+          if (liveWin.displayWidth !== displayWidth || liveWin.displayHeight !== displayHeight) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'display_size_mismatch', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: false,
+              error: 'display_size_mismatch',
+              instance_id: id,
+              expected_display_width: displayWidth,
+              expected_display_height: displayHeight,
+              actual_display_width: liveWin.displayWidth,
+              actual_display_height: liveWin.displayHeight,
+            });
+          }
+
+          if (!deps.scrollInInstance) throw new Error('scrollInInstance handler not configured');
+          try {
+            const actual = await deps.scrollInInstance(inst, {
+              x,
+              y,
+              displayWidth,
+              displayHeight,
+              direction,
+              clicks,
+            });
+            const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
+            auditWrite({ tool: toolName, instance_id: id, result: 'ok', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: true,
+              instance_id: id,
+              x,
+              y,
+              direction,
+              clicks,
+              display_width: actual.displayWidth,
+              display_height: actual.displayHeight,
+              invalidated_drafts: invalidatedDrafts,
+            });
+          } catch (e: any) {
+            if (e instanceof DisplaySizeMismatchError) {
+              auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'display_size_mismatch', duration_ms: state.now() - t0 });
+              return jsonTextResult({
+                ok: false,
+                error: 'display_size_mismatch',
+                instance_id: id,
+                expected_display_width: e.expectedWidth,
+                expected_display_height: e.expectedHeight,
+                actual_display_width: e.actualWidth,
+                actual_display_height: e.actualHeight,
+              });
+            }
+            throw e;
+          }
+        }
+
+        case 'woc_draft_reply': {
+          const id = requireInstanceId(args);
+          logInstanceId = id;
+          const text = args.text;
+          if (typeof text !== 'string' || text.length === 0 || text.length > MAX_DRAFT_TEXT_CHARS) {
+            throw new Error(`invalid_argument: text must be a non-empty string (<= ${MAX_DRAFT_TEXT_CHARS} chars)`);
+          }
+          const textLength = text.length;
+          const shotOpts = parseScreenshotArgs(args, false);
+
+          const inst = deps.findInstance(id);
+          if (!inst) {
+            auditWrite({ tool: toolName, instance_id: id, text_length: textLength, result: 'rejected', error: 'instance_not_found', duration_ms: state.now() - t0 });
+            return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
+          }
+
+          const guard = await checkWriteGuards(inst, false);
+          if (!guard.ok) {
+            auditWrite({ tool: toolName, instance_id: id, text_length: textLength, result: 'rejected', error: guard.error, duration_ms: state.now() - t0 });
+            return jsonTextResult(guard.payload);
+          }
+
+          if (!deps.typeInInstance || !deps.captureSessionFingerprint) {
+            throw new Error('draft reply handlers not configured');
+          }
+
+          // Focus active WeChat chat input, clear any residual text, and paste ONLY — NEVER press Return.
+          await deps.typeInInstance(inst, text, { focusChat: true, clearFirst: true, send: false });
+          const fingerprint = await deps.captureSessionFingerprint(inst);
+          const shot = await deps.captureInstanceScreenshot(inst, shotOpts);
+          const draft = state.draftStore.create(inst.id, textLength, fingerprint);
+          const ttlSec = Math.max(1, Math.round((draft.expiresAt - draft.createdAt) / 1000));
+
+          auditWrite({ tool: toolName, instance_id: id, text_length: textLength, result: 'ok', duration_ms: state.now() - t0 });
+          return {
+            content: [
+              {
+                type: 'image' as const,
+                data: shot.png.toString('base64'),
+                mimeType: 'image/png',
+              },
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  ok: true,
+                  draft_id: draft.draftId,
+                  expires_at: new Date(draft.expiresAt).toISOString(),
+                  ttl_sec: ttlSec,
+                  instance_id: inst.id,
+                  text_length: textLength,
+                  display_width: shot.displayWidth,
+                  display_height: shot.displayHeight,
+                  image_width: shot.imageWidth,
+                  image_height: shot.imageHeight,
+                  bytes: shot.bytes,
+                  fingerprint_summary: {
+                    digest: fingerprint.digest,
+                    header_dhash: fingerprint.headerDhash,
+                    editor_dhash: fingerprint.editorDhash,
+                    header_region: fingerprint.headerRegion,
+                    editor_region: fingerprint.editorRegion,
+                  },
+                  wechat_window: shot.wechatWindow,
+                }),
+              },
+            ],
+          };
+        }
+
+        case 'woc_confirm_send': {
+          const id = requireInstanceId(args);
+          logInstanceId = id;
+          const draftId = args.draft_id;
+          if (typeof draftId !== 'string' || !draftId.trim() || draftId.length > 128) {
+            throw new Error('invalid_argument: draft_id must be a non-empty string');
+          }
+
+          const residualMeta = {
+            input_may_have_residual_draft: true,
+            discard_hint: 'Call woc_discard_draft to clear any residual text in the WeChat input box.',
+          };
+
+          // Atomically consume draft_id immediately so it can NEVER be replayed/retried.
+          const draft = state.draftStore.consume(draftId.trim());
+          if (!draft) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'draft_not_found', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: false,
+              error: 'draft_not_found',
+              instance_id: id,
+              ...residualMeta,
+              message: 'Draft not found or already consumed. Create a new draft with woc_draft_reply or clear the input box with woc_discard_draft.',
+            });
+          }
+
+          if (state.now() > draft.expiresAt) {
+            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'rejected', error: 'draft_expired', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: false,
+              error: 'draft_expired',
+              instance_id: id,
+              ...residualMeta,
+              message: 'Draft expired before confirmation. Create a new draft with woc_draft_reply or clear the input box with woc_discard_draft.',
+            });
+          }
+
+          if (draft.instanceId !== id) {
+            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'rejected', error: 'draft_instance_mismatch', duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: false,
+              error: 'draft_instance_mismatch',
+              instance_id: id,
+              ...residualMeta,
+              message: 'draft_id does not belong to this instance_id; draft has been consumed.',
+            });
+          }
+
+          const inst = deps.findInstance(id);
+          if (!inst) {
+            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'rejected', error: 'instance_not_found', duration_ms: state.now() - t0 });
+            return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id, ...residualMeta }, true);
+          }
+
+          const guard = await checkWriteGuards(inst, true);
+          if (!guard.ok) {
+            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'rejected', error: guard.error, duration_ms: state.now() - t0 });
+            return jsonTextResult({ ...guard.payload, ...residualMeta });
+          }
+
+          if (!deps.captureSessionFingerprint || !deps.keyInInstance) {
+            throw new Error('confirm send handlers not configured');
+          }
+
+          const liveFp = await deps.captureSessionFingerprint(inst);
+          const cmp = compareSessionFingerprints(draft.fingerprint, liveFp);
+          const formatRegionCheck = (m: typeof cmp.headerCheck) => ({
+            match: m.match,
+            hamming_distance: m.hammingDistance,
+            mean_abs_diff: m.meanAbsDiff,
+            changed_pixel_ratio: m.changedPixelRatio,
+          });
+          if (!cmp.match) {
+            const errCode = cmp.reason ?? 'session_fingerprint_mismatch';
+            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'rejected', error: errCode, duration_ms: state.now() - t0 });
+            return jsonTextResult({
+              ok: false,
+              error: errCode,
+              instance_id: id,
+              detail: cmp.detail,
+              header_check: formatRegionCheck(cmp.headerCheck),
+              editor_check: formatRegionCheck(cmp.editorCheck),
+              ...residualMeta,
+              message: 'Active chat window, header, or editor changed since draft; send aborted and draft consumed.',
+            });
+          }
+
+          // Send ONE Return key — NEVER re-paste and NEVER auto-retry on failure.
+          try {
+            await deps.keyInInstance(inst, 'Return');
+          } catch (e: any) {
+            const msg = e instanceof Error ? e.message : String(e);
+            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'error', error: 'send_uncertain_no_retry', duration_ms: state.now() - t0 });
+            return jsonTextResult(
+              {
+                ok: false,
+                error: 'send_uncertain_no_retry',
+                instance_id: id,
+                detail: msg,
+                ...residualMeta,
+                message: 'Return key dispatch failed or timed out; draft was consumed and will NOT be auto-retried. Inspect a screenshot before retrying manually.',
+              },
+              true,
+            );
+          }
+
+          auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'ok', duration_ms: state.now() - t0 });
+          return jsonTextResult({
+            ok: true,
+            sent: true,
+            instance_id: id,
+            text_length: draft.textLength,
+            header_check: formatRegionCheck(cmp.headerCheck),
+            editor_check: formatRegionCheck(cmp.editorCheck),
+          });
+        }
+
+        case 'woc_discard_draft': {
+          const id = requireInstanceId(args);
+          logInstanceId = id;
+          const inst = deps.findInstance(id);
+          if (!inst) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'instance_not_found', duration_ms: state.now() - t0 });
+            return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
+          }
+
+          const guard = await checkWriteGuards(inst, false);
+          if (!guard.ok) {
+            auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: guard.error, duration_ms: state.now() - t0 });
+            return jsonTextResult(guard.payload);
+          }
+
+          if (!deps.clearInputInInstance) {
+            throw new Error('clearInputInInstance handler not configured');
+          }
+
+          const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
+          await deps.clearInputInInstance(inst);
+          auditWrite({ tool: toolName, instance_id: id, result: 'ok', duration_ms: state.now() - t0 });
+          return jsonTextResult({
+            ok: true,
+            instance_id: id,
+            invalidated_drafts: invalidatedDrafts,
+            input_cleared: true,
+          });
+        }
+
         default:
-          log(`[mcp] tool=${toolName} instanceId=${logInstanceId} durationMs=${Date.now() - t0} ok=false reason=unknown_tool`);
+          log(`[mcp] tool=${toolName} instanceId=${logInstanceId} durationMs=${state.now() - t0} ok=false reason=unknown_tool`);
           return jsonTextResult({ ok: false, error: 'unknown_tool', tool: toolName }, true);
       }
     } catch (e: any) {
       const msg = e instanceof Error ? e.message : String(e);
-      log(`[mcp] tool=${toolName} instanceId=${logInstanceId} durationMs=${Date.now() - t0} ok=false error=${msg}`);
+      if (isWriteTool) {
+        auditWrite({ tool: toolName, instance_id: logInstanceId, result: 'error', error: msg, duration_ms: state.now() - t0 });
+      } else {
+        log(`[mcp] tool=${toolName} instanceId=${logInstanceId} durationMs=${state.now() - t0} ok=false error=${msg}`);
+      }
       return jsonTextResult({ ok: false, error: msg }, true);
     }
   });
@@ -624,14 +1520,23 @@ function createMcpServer(deps: McpDeps): Server {
   return server;
 }
 
-export function registerMcp(app: FastifyInstance, deps: McpDeps): { enabled: boolean } {
+export function registerMcp(app: FastifyInstance, deps: McpDeps): { enabled: boolean; allowWrite: boolean } {
   const token = (deps.authToken ?? process.env.MCP_AUTH_TOKEN ?? '').trim();
+  const allowWrite = deps.allowWrite !== undefined ? deps.allowWrite === true : process.env.MCP_ALLOW_WRITE === '1';
   const log = deps.log ?? ((line: string) => console.log(line));
 
   if (!token) {
     log('[mcp] disabled (MCP_AUTH_TOKEN not set)');
-    return { enabled: false };
+    return { enabled: false, allowWrite: false };
   }
+
+  const now = deps.now ?? (() => Date.now());
+  const state: McpRuntimeState = {
+    allowWrite,
+    draftStore: new DraftStore({ ttlMs: deps.draftTtlMs, now }),
+    rateLimiter: new WriteRateLimiter(deps.rateLimits, now),
+    now,
+  };
 
   // Reject any unexpected subpath under /mcp/* explicitly so it never falls back to SPA HTML.
   app.all('/mcp/*', async (_req, reply) => reply.code(404).send({ error: 'not found' }));
@@ -668,7 +1573,7 @@ export function registerMcp(app: FastifyInstance, deps: McpDeps): { enabled: boo
     reply.hijack();
     reply.raw.setHeader('Cache-Control', 'no-store, max-age=0');
 
-    const server = createMcpServer(deps);
+    const server = createMcpServer(deps, state);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -703,6 +1608,6 @@ export function registerMcp(app: FastifyInstance, deps: McpDeps): { enabled: boo
     }
   });
 
-  log('[mcp] read-only Streamable HTTP endpoint enabled at POST /mcp');
-  return { enabled: true };
+  log(`[mcp] Streamable HTTP endpoint enabled at POST /mcp (allowWrite=${allowWrite})`);
+  return { enabled: true, allowWrite };
 }

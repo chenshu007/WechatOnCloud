@@ -7,7 +7,7 @@ import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, 
 import http from 'node:http';
 import { PassThrough } from 'node:stream';
 import zlib from 'node:zlib';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import Docker from 'dockerode';
 import { tarArchive, tarEntry, tarFileStream, tarSingleFile, openTarStream, scanArchive, sniffArchive } from './tar.js';
 import { instanceAppType, requireSupportedApp, type Instance } from './store.js';
@@ -1080,6 +1080,7 @@ export const WECHAT_FOCUS_INPUT = [
 
 export interface TypeOptions {
   focusChat?: boolean; // 先锁定到微信当前会话的输入框（见 WECHAT_FOCUS_INPUT），仅微信实例有效
+  clearFirst?: boolean; // 聚焦输入框后先全选清空（ctrl+a + BackSpace）再粘贴，防止残留旧草稿拼接
   send?: boolean; // 粘贴后回车发送（与粘贴同一次 exec，中间不会被别的输入插队）
 }
 
@@ -1097,11 +1098,29 @@ export async function typeInInstance(inst: Instance, text: string, opts: TypeOpt
     // 要等这俩 fd 关闭，实测每次卡 ~2s。重定向到 /dev/null 后台后，整条链路从 ~2.1s 降到 ~0.08s。
     `echo '${b64}' | base64 -d | xclip -selection clipboard -i >/dev/null 2>&1`,
     ...(focus ? [WECHAT_FOCUS_INPUT] : []),
+    ...(opts.clearFirst ? [xdoKey('ctrl+a'), 'sleep 0.05', xdoKey('BackSpace'), 'sleep 0.05'] : []),
     xdoKey('ctrl+v'),
     // 粘贴时应用要向 xclip 取剪贴板，稍等再回车，免得回车抢在文字上屏之前
     ...(opts.send ? ['sleep 0.15', xdoKey('Return')] : []),
   ].join('\n');
   await withInstanceInput(inst.containerName, () => execCapture(inst, ['bash', '-c', cmd]));
+}
+
+// 清空微信当前会话输入框（聚焦输入框后 ctrl+a + BackSpace，绝不按回车）。
+export async function clearInputInInstance(inst: Instance): Promise<void> {
+  const focus = instanceAppType(inst) === 'wechat';
+  const cmd = [
+    'set -e',
+    'display="${DISPLAY:-}"',
+    'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
+    'export DISPLAY="${display:-:1}"',
+    'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+    ...(focus ? [WECHAT_FOCUS_INPUT] : []),
+    xdoKey('ctrl+a'),
+    'sleep 0.05',
+    xdoKey('BackSpace'),
+  ].join('\n');
+  await withInstanceInput(inst.containerName, () => execCapture(inst, ['bash', '-c', cmd], 'abc', 10000));
 }
 
 // 通过 xdotool 在实例容器内模拟一次按键（如 Return / BackSpace）。
@@ -1874,6 +1893,486 @@ export async function captureInstanceScreenshot(
     wechatWindow: winInfo.wechatWindow,
     bytes: png.length,
     durationMs: Date.now() - t0,
+  };
+}
+
+// ---------- 受控写操作 MCP 辅助能力（点击 / 滚动 / 会话指纹） ----------
+export type MouseButton = 'left' | 'right' | 'middle';
+export type ScrollDirection = 'up' | 'down' | 'left' | 'right';
+
+export class DisplaySizeMismatchError extends Error {
+  readonly code = 'display_size_mismatch';
+  readonly expectedWidth: number;
+  readonly expectedHeight: number;
+  readonly actualWidth: number;
+  readonly actualHeight: number;
+
+  constructor(expectedWidth: number, expectedHeight: number, actualWidth: number, actualHeight: number) {
+    super(
+      `显示分辨率已变化：预期 ${expectedWidth}x${expectedHeight}，当前实际 ${actualWidth}x${actualHeight}`,
+    );
+    this.name = 'DisplaySizeMismatchError';
+    this.expectedWidth = expectedWidth;
+    this.expectedHeight = expectedHeight;
+    this.actualWidth = actualWidth;
+    this.actualHeight = actualHeight;
+  }
+}
+
+export interface ClickOptions {
+  x: number;
+  y: number;
+  displayWidth: number;
+  displayHeight: number;
+  button?: MouseButton;
+  doubleClick?: boolean;
+}
+
+export interface ScrollOptions {
+  x: number;
+  y: number;
+  displayWidth: number;
+  displayHeight: number;
+  direction: ScrollDirection;
+  clicks?: number;
+}
+
+const CLICK_SCRIPT = [
+  'set -eu',
+  'display="$1"; x="$2"; y="$3"; btn="$4"; dbl="$5"',
+  'export DISPLAY="$display"',
+  'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+  XDO_RELEASE_MODS,
+  'if [ "$dbl" = "1" ]; then',
+  '  xdotool mousemove --sync "$x" "$y" click --repeat 2 --delay 80 "$btn"',
+  'else',
+  '  xdotool mousemove --sync "$x" "$y" click "$btn"',
+  'fi',
+].join('\n');
+
+const SCROLL_SCRIPT = [
+  'set -eu',
+  'display="$1"; x="$2"; y="$3"; btn="$4"; clicks="$5"',
+  'export DISPLAY="$display"',
+  'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+  XDO_RELEASE_MODS,
+  'xdotool mousemove --sync "$x" "$y" click --repeat "$clicks" --delay 40 "$btn"',
+].join('\n');
+
+const MOUSE_BUTTON_MAP: Record<MouseButton, string> = {
+  left: '1',
+  middle: '2',
+  right: '3',
+};
+
+const SCROLL_BUTTON_MAP: Record<ScrollDirection, string> = {
+  up: '4',
+  down: '5',
+  left: '6',
+  right: '7',
+};
+
+export async function clickInInstance(
+  inst: Instance,
+  opts: ClickOptions,
+): Promise<{ displayWidth: number; displayHeight: number }> {
+  const btn = MOUSE_BUTTON_MAP[opts.button ?? 'left'];
+  if (!btn) throw new Error('鼠标按键名不合法');
+  return withInstanceInput(inst.containerName, async () => {
+    const winInfo = await wechatWindowInfo(inst);
+    if (winInfo.displayWidth !== opts.displayWidth || winInfo.displayHeight !== opts.displayHeight) {
+      throw new DisplaySizeMismatchError(
+        opts.displayWidth,
+        opts.displayHeight,
+        winInfo.displayWidth,
+        winInfo.displayHeight,
+      );
+    }
+    const x = Math.round(opts.x);
+    const y = Math.round(opts.y);
+    if (x < 0 || x >= winInfo.displayWidth || y < 0 || y >= winInfo.displayHeight) {
+      throw new Error(`点击坐标越界：(${x}, ${y}) 超出 ${winInfo.displayWidth}x${winInfo.displayHeight}`);
+    }
+    if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
+      throw new Error('实例 DISPLAY 名称非法');
+    }
+    await execCapture(
+      inst,
+      [
+        'bash',
+        '-c',
+        CLICK_SCRIPT,
+        'woc-click',
+        winInfo.display,
+        String(x),
+        String(y),
+        btn,
+        opts.doubleClick ? '1' : '0',
+      ],
+      'abc',
+      10000,
+    );
+    return { displayWidth: winInfo.displayWidth, displayHeight: winInfo.displayHeight };
+  });
+}
+
+export async function scrollInInstance(
+  inst: Instance,
+  opts: ScrollOptions,
+): Promise<{ displayWidth: number; displayHeight: number }> {
+  const btn = SCROLL_BUTTON_MAP[opts.direction];
+  if (!btn) throw new Error('滚动方向不合法');
+  const clicks = opts.clicks ?? 3;
+  if (!Number.isInteger(clicks) || clicks < 1 || clicks > 20) {
+    throw new Error('滚动步数必须为 1-20 的整数');
+  }
+  return withInstanceInput(inst.containerName, async () => {
+    const winInfo = await wechatWindowInfo(inst);
+    if (winInfo.displayWidth !== opts.displayWidth || winInfo.displayHeight !== opts.displayHeight) {
+      throw new DisplaySizeMismatchError(
+        opts.displayWidth,
+        opts.displayHeight,
+        winInfo.displayWidth,
+        winInfo.displayHeight,
+      );
+    }
+    const x = Math.round(opts.x);
+    const y = Math.round(opts.y);
+    if (x < 0 || x >= winInfo.displayWidth || y < 0 || y >= winInfo.displayHeight) {
+      throw new Error(`滚动坐标越界：(${x}, ${y}) 超出 ${winInfo.displayWidth}x${winInfo.displayHeight}`);
+    }
+    if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
+      throw new Error('实例 DISPLAY 名称非法');
+    }
+    await execCapture(
+      inst,
+      [
+        'bash',
+        '-c',
+        SCROLL_SCRIPT,
+        'woc-scroll',
+        winInfo.display,
+        String(x),
+        String(y),
+        btn,
+        String(clicks),
+      ],
+      'abc',
+      10000,
+    );
+    return { displayWidth: winInfo.displayWidth, displayHeight: winInfo.displayHeight };
+  });
+}
+
+// 检测坐标是否落入微信主窗口右下角「发送(S)」按钮防误触区（防止经 woc_click 绕过草稿确认链路）。
+export function isInSendButtonZone(x: number, y: number, win: WechatWindowRect | null): boolean {
+  if (!win) return false;
+  return (
+    x >= win.x + win.width - 160 &&
+    x <= win.x + win.width &&
+    y >= win.y + win.height - 72 &&
+    y <= win.y + win.height
+  );
+}
+
+// ---------- 微信 4.1.1.8 会话标题栏 + 输入区轻量灰度指纹（零落盘、单帧原子采集、防串窗与防篡改草稿） ----------
+export const FINGERPRINT_GRID_W = 64;
+export const FINGERPRINT_GRID_H = 16;
+export const FINGERPRINT_RAW_BYTES = FINGERPRINT_GRID_W * FINGERPRINT_GRID_H; // 1024 B per region
+export const FINGERPRINT_COMBINED_BYTES = FINGERPRINT_RAW_BYTES * 2; // 2048 B (header + editor vstacked)
+
+export interface SessionFingerprint {
+  displayWidth: number;
+  displayHeight: number;
+  wechatWindow: WechatWindowRect;
+  headerRegion: ScreenshotCrop;
+  editorRegion: ScreenshotCrop;
+  headerGray: Buffer; // 64x16 8-bit grayscale (1024 bytes), strictly in-memory
+  editorGray: Buffer; // 64x16 8-bit grayscale (1024 bytes), strictly in-memory
+  headerDhash: string; // 64-bit horizontal dHash (16 hex chars)
+  editorDhash: string; // 64-bit horizontal dHash (16 hex chars)
+  digest: string; // 16-hex-char SHA-256 summary for metadata/logging
+}
+
+export interface RegionCheckMetrics {
+  match: boolean;
+  hammingDistance: number;
+  meanAbsDiff: number;
+  changedPixelRatio: number;
+}
+
+export interface FingerprintComparison {
+  match: boolean;
+  reason?: 'window_geometry_mismatch' | 'session_fingerprint_mismatch' | 'editor_fingerprint_mismatch';
+  detail?: string;
+  headerCheck: RegionCheckMetrics;
+  editorCheck: RegionCheckMetrics;
+}
+
+// 基于微信 Linux 4.1.1.8 实测布局计算当前会话标题栏裁剪区：
+// 左侧导航栏 + 会话列表总宽约 350-356px（可拖拽），标题文字从主窗口 x+355 附近起始，顶部 y+6..y+64，
+// 右侧留出 140px 避开窗控/更多按钮。窗口过小时返回 null（安全拒绝）。
+export function computeHeaderRegion(
+  win: WechatWindowRect,
+  displayWidth: number,
+  displayHeight: number,
+): ScreenshotCrop | null {
+  if (win.width < 480 || win.height < 300) return null;
+  const sidebarOffset = win.width >= 900 ? 355 : Math.round(win.width * 0.32);
+  const rawX = win.x + sidebarOffset;
+  const rawY = win.y + 6;
+  const maxRight = Math.min(displayWidth, win.x + win.width - 140);
+  const rawW = Math.min(520, maxRight - rawX);
+  const rawH = Math.min(58, Math.max(24, Math.round(win.height * 0.08)));
+  if (rawW < 80 || rawH < 16) return null;
+  const clamped = clampScreenshotCrop(
+    { x: rawX, y: rawY, width: rawW, height: rawH },
+    displayWidth,
+    displayHeight,
+  );
+  if (clamped.width < 80 || clamped.height < 16) return null;
+  return clamped;
+}
+
+// 基于微信 Linux 4.1.1.8 实测布局计算输入编辑区裁剪区（位于工具栏下方、底部「发送(S)」按钮行上方）。
+export function computeEditorRegion(
+  win: WechatWindowRect,
+  displayWidth: number,
+  displayHeight: number,
+): ScreenshotCrop | null {
+  if (win.width < 480 || win.height < 300) return null;
+  const sidebarOffset = win.width >= 900 ? 355 : Math.round(win.width * 0.32);
+  const rawX = win.x + sidebarOffset;
+  const rawY = win.y + win.height - 142;
+  const rawW = Math.max(120, Math.min(displayWidth, win.x + win.width - 20) - rawX);
+  const rawH = Math.min(82, Math.max(32, win.y + win.height - 60 - rawY));
+  if (rawW < 80 || rawH < 16) return null;
+  const clamped = clampScreenshotCrop(
+    { x: rawX, y: rawY, width: rawW, height: rawH },
+    displayWidth,
+    displayHeight,
+  );
+  if (clamped.width < 80 || clamped.height < 16) return null;
+  return clamped;
+}
+
+// 计算 64x16 灰度图的 64-bit 水平差分哈希（9x8 区块均值比较）。
+export function computeGrayscaleDHash(
+  gray: Buffer,
+  width = FINGERPRINT_GRID_W,
+  height = FINGERPRINT_GRID_H,
+): string {
+  if (!Buffer.isBuffer(gray) || gray.length !== width * height) {
+    throw new Error(`灰度指纹缓冲大小异常：期望 ${width * height} 字节，实际 ${gray?.length ?? 0}`);
+  }
+  const cols = 9;
+  const rows = 8;
+  const grid = new Float64Array(cols * rows);
+  for (let r = 0; r < rows; r++) {
+    const y0 = Math.floor((r * height) / rows);
+    const y1 = Math.max(y0 + 1, Math.floor(((r + 1) * height) / rows));
+    for (let c = 0; c < cols; c++) {
+      const x0 = Math.floor((c * width) / cols);
+      const x1 = Math.max(x0 + 1, Math.floor(((c + 1) * width) / cols));
+      let sum = 0;
+      let count = 0;
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          sum += gray[y * width + x];
+          count++;
+        }
+      }
+      grid[r * cols + c] = count > 0 ? sum / count : 0;
+    }
+  }
+  let hex = '';
+  for (let r = 0; r < rows; r++) {
+    let byte = 0;
+    for (let c = 0; c < 8; c++) {
+      if (grid[r * cols + c] < grid[r * cols + c + 1]) {
+        byte |= 1 << (7 - c);
+      }
+    }
+    hex += byte.toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+export function hexHammingDistance(a: string, b: string): number {
+  if (a.length !== b.length) return Number.MAX_SAFE_INTEGER;
+  let dist = 0;
+  for (let i = 0; i < a.length; i += 2) {
+    let x = parseInt(a.slice(i, i + 2), 16) ^ parseInt(b.slice(i, i + 2), 16);
+    while (x) {
+      dist += x & 1;
+      x >>>= 1;
+    }
+  }
+  return dist;
+}
+
+function compareGrayRegion(
+  aGray: Buffer,
+  bGray: Buffer,
+  aDhash: string,
+  bDhash: string,
+): RegionCheckMetrics {
+  const len = Math.min(aGray.length, bGray.length);
+  if (len !== FINGERPRINT_RAW_BYTES) {
+    return { match: false, hammingDistance: 64, meanAbsDiff: 255, changedPixelRatio: 1 };
+  }
+  let absSum = 0;
+  let changed = 0;
+  for (let i = 0; i < len; i++) {
+    const diff = Math.abs(aGray[i] - bGray[i]);
+    absSum += diff;
+    if (diff >= 20) changed++;
+  }
+  const meanAbsDiff = Number((absSum / len).toFixed(2));
+  const changedPixelRatio = Number((changed / len).toFixed(4));
+  const hammingDistance = hexHammingDistance(aDhash, bDhash);
+  const match = hammingDistance <= 6 && meanAbsDiff <= 6.0 && changedPixelRatio <= 0.04;
+  return { match, hammingDistance, meanAbsDiff, changedPixelRatio };
+}
+
+// 对比草稿期与确认期的会话指纹：先比窗口/屏幕几何，再分别比标题栏与输入区 64x16 灰度像素 + dHash。
+// 阈值取保守值（防串窗与防草稿被篡改优先）：dHash 汉明距离 <= 6、像素平均绝对差 <= 6.0、显著变化像素比例(|Δ|>=20) <= 4%。
+export function compareSessionFingerprints(
+  draft: SessionFingerprint,
+  live: SessionFingerprint,
+): FingerprintComparison {
+  const failMetric: RegionCheckMetrics = { match: false, hammingDistance: 64, meanAbsDiff: 255, changedPixelRatio: 1 };
+  if (
+    draft.displayWidth !== live.displayWidth ||
+    draft.displayHeight !== live.displayHeight ||
+    draft.wechatWindow.id !== live.wechatWindow.id ||
+    draft.wechatWindow.x !== live.wechatWindow.x ||
+    draft.wechatWindow.y !== live.wechatWindow.y ||
+    draft.wechatWindow.width !== live.wechatWindow.width ||
+    draft.wechatWindow.height !== live.wechatWindow.height ||
+    draft.wechatWindow.title !== live.wechatWindow.title ||
+    draft.headerRegion.x !== live.headerRegion.x ||
+    draft.headerRegion.y !== live.headerRegion.y ||
+    draft.headerRegion.width !== live.headerRegion.width ||
+    draft.headerRegion.height !== live.headerRegion.height ||
+    draft.editorRegion.x !== live.editorRegion.x ||
+    draft.editorRegion.y !== live.editorRegion.y ||
+    draft.editorRegion.width !== live.editorRegion.width ||
+    draft.editorRegion.height !== live.editorRegion.height
+  ) {
+    return {
+      match: false,
+      reason: 'window_geometry_mismatch',
+      detail: '显示分辨率或微信主窗口几何信息已发生变化',
+      headerCheck: failMetric,
+      editorCheck: failMetric,
+    };
+  }
+
+  const headerCheck = compareGrayRegion(draft.headerGray, live.headerGray, draft.headerDhash, live.headerDhash);
+  const editorCheck = compareGrayRegion(draft.editorGray, live.editorGray, draft.editorDhash, live.editorDhash);
+
+  if (!headerCheck.match) {
+    return {
+      match: false,
+      reason: 'session_fingerprint_mismatch',
+      detail: `会话标题栏像素变化超出阈值（hamming=${headerCheck.hammingDistance}, meanAbsDiff=${headerCheck.meanAbsDiff}, changedRatio=${headerCheck.changedPixelRatio}）`,
+      headerCheck,
+      editorCheck,
+    };
+  }
+  if (!editorCheck.match) {
+    return {
+      match: false,
+      reason: 'editor_fingerprint_mismatch',
+      detail: `输入编辑区像素变化超出阈值（hamming=${editorCheck.hammingDistance}, meanAbsDiff=${editorCheck.meanAbsDiff}, changedRatio=${editorCheck.changedPixelRatio}）`,
+      headerCheck,
+      editorCheck,
+    };
+  }
+  return { match: true, headerCheck, editorCheck };
+}
+
+// 单帧原子采集：关闭鼠标绘制（-draw_mouse 0），单次 ffmpeg x11grab 切出 header(64x16) 与 editor(64x16) 纵向拼接为 64x32 (2048 B) 原始灰度流。
+const FINGERPRINT_CAPTURE_SCRIPT = [
+  'set -eu',
+  'display="$1"; sw="$2"; sh="$3"; hx="$4"; hy="$5"; hw="$6"; hh="$7"; ex="$8"; ey="$9"; ew="${10}"; eh="${11}"',
+  'export DISPLAY="$display"',
+  'command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg not installed in instance image" >&2; exit 127; }',
+  `fc="[0:v]split=2[h][e];[h]crop=\${hw}:\${hh}:\${hx}:\${hy},scale=${FINGERPRINT_GRID_W}:${FINGERPRINT_GRID_H},format=gray[hs];[e]crop=\${ew}:\${eh}:\${ex}:\${ey},scale=${FINGERPRINT_GRID_W}:${FINGERPRINT_GRID_H},format=gray[es];[hs][es]vstack=inputs=2[out]"`,
+  'exec ffmpeg -loglevel error -draw_mouse 0 -f x11grab -video_size "${sw}x${sh}" -i "${display}+0,0" -vframes 1 -filter_complex "$fc" -map "[out]" -f rawvideo -pix_fmt gray -',
+].join('\n');
+
+export async function captureSessionFingerprint(inst: Instance): Promise<SessionFingerprint> {
+  const winInfo = await wechatWindowInfo(inst);
+  if (!winInfo.wechatWindow) {
+    throw new Error('未找到可见的微信主窗口，无法采集会话指纹');
+  }
+  const headerRegion = computeHeaderRegion(
+    winInfo.wechatWindow,
+    winInfo.displayWidth,
+    winInfo.displayHeight,
+  );
+  const editorRegion = computeEditorRegion(
+    winInfo.wechatWindow,
+    winInfo.displayWidth,
+    winInfo.displayHeight,
+  );
+  if (!headerRegion || !editorRegion) {
+    throw new Error('微信主窗口尺寸过小或不可见，无法安全定位会话标题栏与输入区');
+  }
+  if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
+    throw new Error('实例 DISPLAY 名称非法');
+  }
+  const combined = await execCaptureBuffer(
+    inst,
+    [
+      'bash',
+      '-c',
+      FINGERPRINT_CAPTURE_SCRIPT,
+      'woc-fingerprint',
+      winInfo.display,
+      String(winInfo.displayWidth),
+      String(winInfo.displayHeight),
+      String(headerRegion.x),
+      String(headerRegion.y),
+      String(headerRegion.width),
+      String(headerRegion.height),
+      String(editorRegion.x),
+      String(editorRegion.y),
+      String(editorRegion.width),
+      String(editorRegion.height),
+    ],
+    'abc',
+    8000,
+    8192,
+  );
+  if (combined.length !== FINGERPRINT_COMBINED_BYTES) {
+    throw new Error(`会话指纹原始字节数异常：期望 ${FINGERPRINT_COMBINED_BYTES}，实际 ${combined.length}`);
+  }
+  const headerGray = Buffer.from(combined.subarray(0, FINGERPRINT_RAW_BYTES));
+  const editorGray = Buffer.from(combined.subarray(FINGERPRINT_RAW_BYTES, FINGERPRINT_COMBINED_BYTES));
+  const headerDhash = computeGrayscaleDHash(headerGray);
+  const editorDhash = computeGrayscaleDHash(editorGray);
+  const digest = createHash('sha256')
+    .update(headerGray)
+    .update(editorGray)
+    .update(
+      `${winInfo.displayWidth}x${winInfo.displayHeight}:${winInfo.wechatWindow.id}:${headerRegion.x},${headerRegion.y},${headerRegion.width}x${headerRegion.height}:${editorRegion.x},${editorRegion.y},${editorRegion.width}x${editorRegion.height}`,
+    )
+    .digest('hex')
+    .slice(0, 16);
+  return {
+    displayWidth: winInfo.displayWidth,
+    displayHeight: winInfo.displayHeight,
+    wechatWindow: winInfo.wechatWindow,
+    headerRegion,
+    editorRegion,
+    headerGray,
+    editorGray,
+    headerDhash,
+    editorDhash,
+    digest,
   };
 }
 

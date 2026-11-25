@@ -105,5 +105,15 @@ RUN chmod 755 /custom-cont-init.d/01-woc-autostart
 COPY woc-app-init.sh /custom-cont-init.d/02-woc-app
 RUN chmod 755 /custom-cont-init.d/02-woc-app
 
+# 启动钩子（03）：清掉非正常退出（断电 / 强杀）残留的 X 显示锁，否则 Xvnc 可能误判显示被占用而起不来（上游 54f80e1）。
+COPY woc-xlock.sh /custom-cont-init.d/03-woc-xlock
+RUN chmod 755 /custom-cont-init.d/03-woc-xlock
+
+# 桌面会话入口：停止容器时先让应用正常退出，再让 s6 去停 Xvnc（上游 85a9730）。
+# S6_SERVICES_GRACETIME 给应用正常退出留足时间；面板 STOP_GRACE_SEC=15 比它长。
+COPY woc-startwm.sh /defaults/startwm.sh
+RUN chmod 755 /defaults/startwm.sh && grep -q graceful_stop /defaults/startwm.sh
+ENV S6_SERVICES_GRACETIME=10000
+
 # 3000 = HTTP web 客户端, 3001 = HTTPS
 EXPOSE 3000 3001

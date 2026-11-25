@@ -299,6 +299,8 @@ async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): P
     Hostname: realisticHostname(inst.id),
     Env: envList(inst),
     ExposedPorts: { '3000/tcp': {} },
+    // 宿主关机、Docker 重启时同样按 15 秒停容器，给应用留足正常退出时间（配合 docker/woc-startwm.sh，上游 85a9730）。
+    StopTimeout: STOP_GRACE_SEC,
     HostConfig: hostConfig,
   };
   // 自定义网络时，MAC 须写到对应 endpoint 上（新版 docker 弃用顶层 MacAddress）；默认网络则用顶层。
@@ -406,8 +408,9 @@ export async function regenInstanceMachineId(inst: Instance): Promise<void> {
   await runInstance(inst, { keepImage: true });
 }
 
-// 先正常停止容器再删除，避免直接 remove({ force: true }) SIGKILL 微信导致数据未落盘（移植自上游 7bba05f）。
-const STOP_GRACE_SEC = 10;
+// 先正常停止容器再删除，避免直接 remove({ force: true }) SIGKILL 微信导致数据未落盘（上游 7bba05f + 85a9730）。
+// 超时 15s 须长于实例镜像的 S6_SERVICES_GRACETIME=10000（10s）。
+const STOP_GRACE_SEC = 15;
 async function stopGracefully(c: Docker.Container): Promise<void> {
   try {
     await c.stop({ t: STOP_GRACE_SEC } as any);

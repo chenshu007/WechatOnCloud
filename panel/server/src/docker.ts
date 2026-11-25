@@ -1073,7 +1073,10 @@ export const WECHAT_FOCUS_INPUT = [
   'eval "$(xdotool getmouselocation --shell | grep -E \'^(X|Y)=[0-9]+$\')"; ox=$X; oy=$Y',
   'xdotool windowactivate --sync "$main" >/dev/null 2>&1 || true',
   `${XDO_RELEASE_MODS}`,
-  'xdotool mousemove --sync "$cx" "$cy" click 1',
+  // 不用 mousemove --sync：xdotool 3.20160805（Debian bookworm）在指针已停在目标坐标时会空等 500×30ms=15s。
+  'xdotool mousemove "$cx" "$cy"',
+  'sleep 0.05',
+  'xdotool click 1',
   'xdotool key ctrl+End',
   'xdotool mousemove "$ox" "$oy"',
 ].join('\n');
@@ -1082,6 +1085,8 @@ export interface TypeOptions {
   focusChat?: boolean; // 先锁定到微信当前会话的输入框（见 WECHAT_FOCUS_INPUT），仅微信实例有效
   clearFirst?: boolean; // 聚焦输入框后先全选清空（ctrl+a + BackSpace）再粘贴，防止残留旧草稿拼接
   send?: boolean; // 粘贴后回车发送（与粘贴同一次 exec，中间不会被别的输入插队）
+  lockHeld?: boolean; // 调用方已通过 withInstanceInputLock 持有该实例输入锁，这里不再加锁
+  killAfterSec?: number; // 容器内用 timeout 限时，超时即杀掉整组进程，保证不会在返回之后才触发按键
 }
 
 export async function typeInInstance(inst: Instance, text: string, opts: TypeOptions = {}): Promise<void> {
@@ -1103,11 +1108,16 @@ export async function typeInInstance(inst: Instance, text: string, opts: TypeOpt
     // 粘贴时应用要向 xclip 取剪贴板，稍等再回车，免得回车抢在文字上屏之前
     ...(opts.send ? ['sleep 0.15', xdoKey('Return')] : []),
   ].join('\n');
-  await withInstanceInput(inst.containerName, () => execCapture(inst, ['bash', '-c', cmd]));
+  const run = async (): Promise<void> => {
+    if (opts.killAfterSec) assertInputOk(await execInputScript(inst, cmd, [], opts.killAfterSec), '粘贴');
+    else await execCapture(inst, ['bash', '-c', cmd]);
+  };
+  if (opts.lockHeld) await run();
+  else await withInstanceInput(inst.containerName, run);
 }
 
 // 清空微信当前会话输入框（聚焦输入框后 ctrl+a + BackSpace，绝不按回车）。
-export async function clearInputInInstance(inst: Instance): Promise<void> {
+export async function clearInputInInstance(inst: Instance, opts: { lockHeld?: boolean } = {}): Promise<void> {
   const focus = instanceAppType(inst) === 'wechat';
   const cmd = [
     'set -e',
@@ -1120,7 +1130,47 @@ export async function clearInputInInstance(inst: Instance): Promise<void> {
     'sleep 0.05',
     xdoKey('BackSpace'),
   ].join('\n');
-  await withInstanceInput(inst.containerName, () => execCapture(inst, ['bash', '-c', cmd], 'abc', 10000));
+  const run = async (): Promise<void> => {
+    assertInputOk(await execInputScript(inst, cmd, [], INPUT_KILL_AFTER_SEC), '清空输入框');
+  };
+  if (opts.lockHeld) await run();
+  else await withInstanceInput(inst.containerName, run);
+}
+
+// 让调用方把「校验 + 输入」放进同一把实例输入锁里（锁不可重入：期间其它输入请求直接 409）。
+export function withInstanceInputLock<T>(inst: Instance, operation: () => Promise<T>): Promise<T> {
+  return withInstanceInput(inst.containerName, operation);
+}
+
+// 确认发送专用：校验微信主窗口仍是当前活动窗口后只按一次回车。不加锁，调用方必须已持有实例输入锁。
+// 焦点被弹窗 / 其它窗口抢走时以 focus_mismatch 退出，此时确定没有按键发出。
+export const SEND_RETURN_SCRIPT = [
+  'set -eu',
+  'display="${DISPLAY:-}"',
+  'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
+  'export DISPLAY="${display:-:1}"',
+  'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+  'expected="$1"; check="$2"',
+  'if [ "$check" = "1" ]; then',
+  '  active="$(xdotool getactivewindow 2>/dev/null || true)"',
+  '  if [ "$active" != "$expected" ]; then echo "focus_mismatch active=${active:-none} expected=$expected" >&2; exit 4; fi',
+  'fi',
+  xdoKey('Return'),
+].join('\n');
+
+export async function sendReturnInInstance(
+  inst: Instance,
+  expectedWindowId: string,
+  opts: { focusCheck?: boolean } = {},
+): Promise<void> {
+  if (!/^[0-9]{1,20}$/.test(expectedWindowId)) throw new InputCommandError('input_precondition_failed', 'no', '微信主窗口 ID 非法');
+  const res = await execInputScript(
+    inst,
+    SEND_RETURN_SCRIPT,
+    ['woc-send-return', expectedWindowId, opts.focusCheck === false ? '0' : '1'],
+    5,
+  );
+  assertInputOk(res, '发送回车');
 }
 
 // 通过 xdotool 在实例容器内模拟一次按键（如 Return / BackSpace）。
@@ -1834,6 +1884,131 @@ async function execCaptureBuffer(
   );
 }
 
+// ---------- 受控输入脚本执行（限时必杀 + 区分「确定没执行」与「结果未知」） ----------
+export interface ScriptResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+// dispatched='no'：确定没有任何点击 / 滚轮 / 按键发出；'unknown'：可能已部分执行。
+export class InputCommandError extends Error {
+  readonly code: 'input_timeout' | 'focus_mismatch' | 'input_precondition_failed' | 'input_failed';
+  readonly dispatched: 'no' | 'unknown';
+
+  constructor(code: InputCommandError['code'], dispatched: InputCommandError['dispatched'], message: string) {
+    super(message);
+    this.name = 'InputCommandError';
+    this.code = code;
+    this.dispatched = dispatched;
+  }
+}
+
+export const INPUT_KILL_AFTER_SEC = 8;
+// 脚本内约定的「前置条件不满足」退出码：这些分支都在第一个点击 / 按键之前退出。
+// 3=找不到微信主窗口或输入框不可见；4=活动窗口不是微信主窗口；5=指针未到达目标坐标；127=缺少命令。
+const INPUT_PRECONDITION_EXIT_CODES = new Set([3, 4, 5, 127]);
+
+// 收集 docker exec 的退出码与输出：非零退出码不抛错，交给 assertInputOk 判定。
+export function collectScriptResult(
+  stream: NodeJS.EventEmitter & { destroy: () => void },
+  demux: (
+    s: any,
+    stdout: { write: (b: Buffer) => void },
+    stderr: { write: (b: Buffer) => void },
+  ) => void,
+  inspectExec: () => Promise<{ Running?: boolean; ExitCode?: number | null }>,
+  opts: { timeoutMs: number },
+): Promise<ScriptResult> {
+  return new Promise<ScriptResult>((resolve, reject) => {
+    let settled = false;
+    let ended = false;
+    let out = '';
+    let err = '';
+    const outDecoder = new StringDecoder('utf8');
+    const errDecoder = new StringDecoder('utf8');
+
+    const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stream.destroy();
+      reject(e);
+    };
+    const timer = setTimeout(() => fail(new Error('命令结果未知：执行超时')), opts.timeoutMs);
+
+    demux(
+      stream,
+      { write: (b: Buffer) => { if (out.length < 4096) out += outDecoder.write(b); } },
+      { write: (b: Buffer) => { if (err.length < 4096) err += errDecoder.write(b); } },
+    );
+    stream.on('close', () => {
+      if (!ended) fail(new Error('命令结果未知：连接关闭'));
+    });
+    stream.on('end', async () => {
+      ended = true;
+      if (settled) return;
+      try {
+        const info = await inspectExec();
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (info.Running || info.ExitCode == null) {
+          reject(new Error('命令结果未知：无法确认执行已结束'));
+          return;
+        }
+        resolve({ exitCode: info.ExitCode, stdout: out + outDecoder.end(), stderr: err + errDecoder.end() });
+      } catch (e: any) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+    stream.on('error', (e: any) => fail(e instanceof Error ? e : new Error(String(e))));
+  });
+}
+
+// 在实例容器内以 `timeout -k 1 N bash -c script` 执行输入脚本：超过 N 秒整组进程被 SIGTERM（再 1 秒 SIGKILL），
+// 所以调用返回之后不会再有迟到的点击 / 按键；面板侧超时比容器内再多留 3 秒。
+async function execInputScript(
+  inst: Instance,
+  script: string,
+  args: string[],
+  killAfterSec: number,
+): Promise<ScriptResult> {
+  const c = docker.getContainer(inst.containerName);
+  const cmd = ['timeout', '-k', '1', String(killAfterSec), 'bash', '-c', script, ...args];
+  const exec = await execCreate(c, { Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: 'abc' });
+  const stream = await exec.start({ hijack: true, stdin: false });
+  return collectScriptResult(
+    stream,
+    (s, stdout, stderr) => docker.modem.demuxStream(s, stdout as any, stderr as any),
+    () => exec.inspect(),
+    { timeoutMs: (killAfterSec + 3) * 1000 },
+  );
+}
+
+export function assertInputOk(res: ScriptResult, what: string): void {
+  if (res.exitCode === 0) return;
+  const detail = (res.stderr || res.stdout).trim().slice(0, 300);
+  if (res.exitCode === 124 || res.exitCode === 137) {
+    throw new InputCommandError(
+      'input_timeout',
+      'unknown',
+      `${what}超时：容器内进程已被终止，不会延迟触发；是否已部分执行未知`,
+    );
+  }
+  if (INPUT_PRECONDITION_EXIT_CODES.has(res.exitCode)) {
+    throw new InputCommandError(
+      res.exitCode === 4 ? 'focus_mismatch' : 'input_precondition_failed',
+      'no',
+      detail || `${what}前置条件不满足（退出码 ${res.exitCode}）`,
+    );
+  }
+  throw new InputCommandError('input_failed', 'unknown', detail || `${what}失败（退出码 ${res.exitCode}）`);
+}
+
 const SCREENSHOT_CAPTURE_SCRIPT = [
   'set -eu',
   'display="$1"; cap_w="$2"; cap_h="$3"; cap_x="$4"; cap_y="$5"; scale_w="$6"',
@@ -1937,26 +2112,38 @@ export interface ScrollOptions {
   clicks?: number;
 }
 
-const CLICK_SCRIPT = [
+// 移动指针后核对落点再点击。不用 `mousemove --sync`：xdotool 3.20160805（Debian bookworm）的 --sync 是
+// 「等指针离开原位置」，指针本来就在目标坐标时会空等 500×30ms=15s —— 同一坐标连续两次点击 / 滚动必然超时。
+const MOVE_POINTER_LINES = [
+  'xdotool mousemove "$x" "$y"',
+  'sleep 0.05',
+  'X=""; Y=""',
+  'eval "$(xdotool getmouselocation --shell | grep -E \'^(X|Y)=[0-9]+$\')"',
+  'if [ "$X" != "$x" ] || [ "$Y" != "$y" ]; then echo "pointer_not_at_target actual=${X:-?},${Y:-?} target=$x,$y" >&2; exit 5; fi',
+];
+
+export const CLICK_SCRIPT = [
   'set -eu',
   'display="$1"; x="$2"; y="$3"; btn="$4"; dbl="$5"',
   'export DISPLAY="$display"',
   'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
   XDO_RELEASE_MODS,
+  ...MOVE_POINTER_LINES,
   'if [ "$dbl" = "1" ]; then',
-  '  xdotool mousemove --sync "$x" "$y" click --repeat 2 --delay 80 "$btn"',
+  '  xdotool click --repeat 2 --delay 80 "$btn"',
   'else',
-  '  xdotool mousemove --sync "$x" "$y" click "$btn"',
+  '  xdotool click "$btn"',
   'fi',
 ].join('\n');
 
-const SCROLL_SCRIPT = [
+export const SCROLL_SCRIPT = [
   'set -eu',
   'display="$1"; x="$2"; y="$3"; btn="$4"; clicks="$5"',
   'export DISPLAY="$display"',
   'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
   XDO_RELEASE_MODS,
-  'xdotool mousemove --sync "$x" "$y" click --repeat "$clicks" --delay 40 "$btn"',
+  ...MOVE_POINTER_LINES,
+  'xdotool click --repeat "$clicks" --delay 40 "$btn"',
 ].join('\n');
 
 const MOUSE_BUTTON_MAP: Record<MouseButton, string> = {
@@ -1996,21 +2183,14 @@ export async function clickInInstance(
     if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
       throw new Error('实例 DISPLAY 名称非法');
     }
-    await execCapture(
-      inst,
-      [
-        'bash',
-        '-c',
+    assertInputOk(
+      await execInputScript(
+        inst,
         CLICK_SCRIPT,
-        'woc-click',
-        winInfo.display,
-        String(x),
-        String(y),
-        btn,
-        opts.doubleClick ? '1' : '0',
-      ],
-      'abc',
-      10000,
+        ['woc-click', winInfo.display, String(x), String(y), btn, opts.doubleClick ? '1' : '0'],
+        INPUT_KILL_AFTER_SEC,
+      ),
+      '点击',
     );
     return { displayWidth: winInfo.displayWidth, displayHeight: winInfo.displayHeight };
   });
@@ -2044,21 +2224,14 @@ export async function scrollInInstance(
     if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
       throw new Error('实例 DISPLAY 名称非法');
     }
-    await execCapture(
-      inst,
-      [
-        'bash',
-        '-c',
+    assertInputOk(
+      await execInputScript(
+        inst,
         SCROLL_SCRIPT,
-        'woc-scroll',
-        winInfo.display,
-        String(x),
-        String(y),
-        btn,
-        String(clicks),
-      ],
-      'abc',
-      10000,
+        ['woc-scroll', winInfo.display, String(x), String(y), btn, String(clicks)],
+        INPUT_KILL_AFTER_SEC,
+      ),
+      '滚动',
     );
     return { displayWidth: winInfo.displayWidth, displayHeight: winInfo.displayHeight };
   });
@@ -2075,15 +2248,15 @@ export function isInSendButtonZone(x: number, y: number, win: WechatWindowRect |
   );
 }
 
-// ---------- 微信 4.1.1.8 原生 1:1 标题栏 + 多帧标定输入区灰度指纹（零落盘、单帧原子采集） ----------
-export const EDITOR_FINGERPRINT_HEIGHT = 32;
+// ---------- 微信 4.1.1.8 原生 1:1 标题栏 + 原生 1:1 输入区灰度指纹（零落盘、单帧原子采集） ----------
 export const HEADER_INK_DELTA = 20;
 // 实测 1836x884「文件传输助手」(6 汉字)在 280x44 原生标题区占 721 px (|px-bg|>=20)；
 // 2 汉字约 240 px，取 75 px 作为防空白下限，兼顾细笔画短名且稳定拦截空白标题栏。
 export const MIN_HEADER_INK_PIXELS = 75;
-// 实测 3 帧采样取最小差异（t=0, 350ms, 700ms）：同草稿闪烁噪声上限 diff_pixels=0，
-// 单字改动信号下限 diff_pixels=33；取 4 作为严格上限（8.25x 安全余量）。
-export const DEFAULT_EDITOR_MAX_DIFF_PIXELS = 4;
+// 输入区按原生 1:1 逐像素比对，确认时最多 3 帧取最小差异（t=0, 350ms, 700ms）消除光标闪烁。
+// 缩放到 280x32 时实测同草稿 3 帧最小差异恒为 0，而单个数字的改动只有约 10 px、标点更小，
+// 所以不留容差：默认 0，差 1 像素即拒绝。上机标定后可用 MCP_EDITOR_MAX_DIFF_PIXELS 调整。
+export const DEFAULT_EDITOR_MAX_DIFF_PIXELS = 0;
 
 export interface SessionFingerprint {
   displayWidth: number;
@@ -2092,10 +2265,16 @@ export interface SessionFingerprint {
   headerRegion: ScreenshotCrop;
   editorRegion: ScreenshotCrop;
   headerGray: Buffer; // native 1:1 grayscale (headerRegion.width * headerRegion.height bytes), strictly in-memory
-  editorGray: Buffer; // scaled grayscale (headerRegion.width * 32 bytes), strictly in-memory
+  editorGray: Buffer; // native 1:1 grayscale (editorRegion.width * editorRegion.height bytes), strictly in-memory
   headerInkPixels: number;
   headerBg: number;
+  headerDigest: string; // 32-hex-char SHA-256 of the header bitmap + its size: stable identity of the open chat title
   digest: string; // 16-hex-char SHA-256 summary for metadata/logging
+}
+
+// 会话标题栏身份摘要：只取标题位图与其尺寸，同一会话多次采集恒定，可跨调用比对。
+export function computeHeaderDigest(headerGray: Buffer, width: number, height: number): string {
+  return createHash('sha256').update(headerGray).update(`|${width}x${height}`).digest('hex').slice(0, 32);
 }
 
 export interface HeaderCheckMetrics {
@@ -2196,7 +2375,7 @@ export function countHeaderInkPixels(buf: Buffer): { bg: number; inkPixels: numb
 // 对比草稿期与确认期的会话指纹：
 // 1. 窗口/屏幕/裁剪区几何必须完全一致（否则 window_geometry_mismatch）；
 // 2. HEADER 原生 1:1 灰度图逐像素精确比对，零容差（diffPixels === 0，差 1 像素即 session_fingerprint_mismatch）；
-// 3. EDITOR 使用 280x32 灰度图 diffPixels 比对，默认上限 DEFAULT_EDITOR_MAX_DIFF_PIXELS=4（配合确认时最多 3 帧早退采样消除光标闪烁）；显式传入 null 可退回仅诊断模式。
+// 3. EDITOR 原生 1:1 灰度图 diffPixels 比对，默认上限 DEFAULT_EDITOR_MAX_DIFF_PIXELS=0（配合确认时最多 3 帧早退采样消除光标闪烁）；显式传入 null 可退回仅诊断模式。
 export function compareSessionFingerprints(
   draft: SessionFingerprint,
   live: SessionFingerprint,
@@ -2265,7 +2444,7 @@ export function compareSessionFingerprints(
   }
 
   // Decoupled EDITOR comparison (diagnostic-only when maxEditorDiff === null).
-  const expectedEditorLen = draft.headerRegion.width * EDITOR_FINGERPRINT_HEIGHT;
+  const expectedEditorLen = draft.editorRegion.width * draft.editorRegion.height;
   let editorCheck: EditorCheckMetrics;
   if (draft.editorGray.length !== expectedEditorLen || live.editorGray.length !== expectedEditorLen) {
     editorCheck = {
@@ -2325,14 +2504,18 @@ export function compareSessionFingerprints(
   return { match: true, headerCheck, editorCheck };
 }
 
-// 单帧原子采集（~187ms）：关闭鼠标绘制（-draw_mouse 0），单次 ffmpeg x11grab 切出
-// 原生 1:1 header (hw x hh，不缩放) 与 editor (hw x 32) 纵向拼接为 hw x (hh + 32) 原始灰度流。
+// 单帧原子采集：关闭鼠标绘制（-draw_mouse 0），单次 ffmpeg x11grab 切出原生 1:1 的 header (hw x hh) 与
+// editor (ew x eh)，都不缩放；两块右侧补黑到同宽 pw 后纵向拼接为 pw x (hh + eh) 原始灰度流。
+export const FINGERPRINT_FILTER_GRAPH =
+  '[0:v]split=2[h][e];[h]crop=${hw}:${hh}:${hx}:${hy},format=gray,pad=${pw}:${hh}:0:0:black[hs];' +
+  '[e]crop=${ew}:${eh}:${ex}:${ey},format=gray,pad=${pw}:${eh}:0:0:black[es];[hs][es]vstack=inputs=2[out]';
+
 const FINGERPRINT_CAPTURE_SCRIPT = [
   'set -eu',
-  'display="$1"; sw="$2"; sh="$3"; hx="$4"; hy="$5"; hw="$6"; hh="$7"; ex="$8"; ey="$9"; ew="${10}"; eh="${11}"',
+  'display="$1"; sw="$2"; sh="$3"; hx="$4"; hy="$5"; hw="$6"; hh="$7"; ex="$8"; ey="$9"; ew="${10}"; eh="${11}"; pw="${12}"',
   'export DISPLAY="$display"',
   'command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg not installed in instance image" >&2; exit 127; }',
-  `fc="[0:v]split=2[h][e];[h]crop=\${hw}:\${hh}:\${hx}:\${hy},format=gray[hs];[e]crop=\${ew}:\${eh}:\${ex}:\${ey},scale=\${hw}:${EDITOR_FINGERPRINT_HEIGHT},format=gray[es];[hs][es]vstack=inputs=2[out]"`,
+  `fc="${FINGERPRINT_FILTER_GRAPH}"`,
   'exec ffmpeg -loglevel error -draw_mouse 0 -f x11grab -video_size "${sw}x${sh}" -i "${display}+0,0" -vframes 1 -filter_complex "$fc" -map "[out]" -f rawvideo -pix_fmt gray -',
 ].join('\n');
 
@@ -2357,9 +2540,8 @@ export async function captureSessionFingerprint(inst: Instance): Promise<Session
   if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
     throw new Error('实例 DISPLAY 名称非法');
   }
-  const expectedHeaderBytes = headerRegion.width * headerRegion.height;
-  const expectedEditorBytes = headerRegion.width * EDITOR_FINGERPRINT_HEIGHT;
-  const expectedTotalBytes = expectedHeaderBytes + expectedEditorBytes;
+  const stride = Math.max(headerRegion.width, editorRegion.width);
+  const expectedTotalBytes = stride * (headerRegion.height + editorRegion.height);
   const combined = await execCaptureBuffer(
     inst,
     [
@@ -2378,6 +2560,7 @@ export async function captureSessionFingerprint(inst: Instance): Promise<Session
       String(editorRegion.y),
       String(editorRegion.width),
       String(editorRegion.height),
+      String(stride),
     ],
     'abc',
     8000,
@@ -2386,9 +2569,10 @@ export async function captureSessionFingerprint(inst: Instance): Promise<Session
   if (combined.length !== expectedTotalBytes) {
     throw new Error(`会话指纹原始字节数异常：期望 ${expectedTotalBytes}，实际 ${combined.length}`);
   }
-  const headerGray = Buffer.from(combined.subarray(0, expectedHeaderBytes));
-  const editorGray = Buffer.from(combined.subarray(expectedHeaderBytes, expectedTotalBytes));
+  const headerGray = extractGrayRows(combined, stride, 0, headerRegion.width, headerRegion.height);
+  const editorGray = extractGrayRows(combined, stride, headerRegion.height, editorRegion.width, editorRegion.height);
   const { bg: headerBg, inkPixels: headerInkPixels } = countHeaderInkPixels(headerGray);
+  const headerDigest = computeHeaderDigest(headerGray, headerRegion.width, headerRegion.height);
   const digest = createHash('sha256')
     .update(headerGray)
     .update(editorGray)
@@ -2407,8 +2591,59 @@ export async function captureSessionFingerprint(inst: Instance): Promise<Session
     editorGray,
     headerInkPixels,
     headerBg,
+    headerDigest,
     digest,
   };
+}
+
+// 从步长为 stride 的灰度位图里取出从 rowOffset 行开始、左对齐的 width x height 子块。
+export function extractGrayRows(buf: Buffer, stride: number, rowOffset: number, width: number, height: number): Buffer {
+  if (width > stride || buf.length < stride * (rowOffset + height)) {
+    throw new Error('灰度位图尺寸不足，无法切出指纹区域');
+  }
+  const out = Buffer.allocUnsafe(width * height);
+  for (let r = 0; r < height; r++) {
+    const start = (rowOffset + r) * stride;
+    buf.copy(out, r * width, start, start + width);
+  }
+  return out;
+}
+
+const PNG_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  let crc = 0xffffffff;
+  for (let i = 0; i < body.length; i++) crc = PNG_CRC_TABLE[(crc ^ body[i]) & 0xff] ^ (crc >>> 8);
+  const out = Buffer.alloc(body.length + 8);
+  out.writeUInt32BE(data.length, 0);
+  body.copy(out, 4);
+  out.writeUInt32BE((crc ^ 0xffffffff) >>> 0, body.length + 4);
+  return out;
+}
+
+// 把内存里的 8 位灰度位图编码成 PNG（不落盘）：让调用方看到的图和服务端用来比对 / 算摘要的是同一份字节。
+export function encodeGrayPng(gray: Buffer, width: number, height: number): Buffer {
+  if (width <= 0 || height <= 0 || gray.length !== width * height) {
+    throw new Error('灰度位图尺寸与数据长度不符');
+  }
+  const raw = Buffer.alloc((width + 1) * height);
+  for (let y = 0; y < height; y++) {
+    gray.copy(raw, y * (width + 1) + 1, y * width, (y + 1) * width);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  return Buffer.concat([PNG_MAGIC, pngChunk('IHDR', ihdr), pngChunk('IDAT', zlib.deflateSync(raw)), pngChunk('IEND', Buffer.alloc(0))]);
 }
 
 export { WECHAT_IMAGE };

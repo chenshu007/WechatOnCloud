@@ -10,8 +10,11 @@ import {
 } from './store.js';
 import {
   compareSessionFingerprints,
+  countHeaderInkPixels,
   DEFAULT_EDITOR_MAX_DIFF_PIXELS,
   DisplaySizeMismatchError,
+  encodeGrayPng,
+  InputCommandError,
   isInSendButtonZone,
   MIN_HEADER_INK_PIXELS,
   type ClickOptions,
@@ -45,6 +48,13 @@ const DEFAULT_DRAFT_TTL_MS = 60_000;
 const MAX_DRAFT_ENTRIES = 32;
 const DEFAULT_CONFIRM_MAX_SAMPLES = 3;
 const DEFAULT_CONFIRM_SAMPLE_DELAY_MS = 350;
+const DEFAULT_POST_SEND_SETTLE_MS = 300;
+const DRAFT_PASTE_KILL_AFTER_SEC = 12;
+const MAX_EDITOR_MAX_DIFF_PIXELS = 100_000;
+const RESIDUAL_DRAFT_META = {
+  input_may_have_residual_draft: true,
+  discard_hint: 'Call woc_discard_draft to clear any residual text in the WeChat input box.',
+} as const;
 const DEFAULT_WRITE_WINDOW_MS = 60_000;
 const DEFAULT_WRITE_MAX_PER_WINDOW = 20;
 const DEFAULT_SEND_WINDOW_MS = 60_000;
@@ -88,7 +98,10 @@ export interface McpDeps {
   scrollInInstance?: (inst: Instance, opts: ScrollOptions) => Promise<{ displayWidth: number; displayHeight: number }>;
   typeInInstance?: (inst: Instance, text: string, opts?: TypeOptions) => Promise<void>;
   clearInputInInstance?: (inst: Instance) => Promise<void>;
-  keyInInstance?: (inst: Instance, key: string) => Promise<void>;
+  // Presses Return once after checking the WeChat main window is still active. Must NOT take the input lock itself.
+  sendReturnInInstance?: (inst: Instance, expectedWindowId: string, opts?: { focusCheck?: boolean }) => Promise<void>;
+  // Runs op while holding the instance input lock (non-reentrant; rejects with statusCode 409 when busy).
+  withInputLock?: <T>(inst: Instance, op: () => Promise<T>) => Promise<T>;
   captureSessionFingerprint?: (inst: Instance) => Promise<SessionFingerprint>;
   effectiveLimits: (inst: Instance) => { soft: number; hard: number };
   activeVncViewerCount: (id: string) => number;
@@ -98,6 +111,8 @@ export interface McpDeps {
   editorMaxDiffPixels?: number | null;
   confirmMaxSamples?: number;
   confirmSampleDelayMs?: number;
+  postSendSettleMs?: number;
+  confirmFocusCheck?: boolean;
   sleep?: (ms: number) => Promise<void>;
   rateLimits?: WriteRateLimitConfig;
   now?: () => number;
@@ -281,9 +296,26 @@ export const MCP_TOOLS: Tool[] = [
 
 export const MCP_WRITE_TOOLS: Tool[] = [
   {
+    name: 'woc_session_header',
+    description:
+      'Read-only companion of the write tools (only listed when they are enabled). Captures the title bar of the chat that is open right now at native resolution and returns it as an image together with header_digest, a stable identifier of that title. Pass header_digest as expected_header_digest to woc_draft_reply so the draft is refused if a different chat is open by then. Chats with pixel-identical titles share a digest.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instance_id: {
+          type: 'string',
+          description: 'Instance ID (from woc_list_instances).',
+        },
+      },
+      required: ['instance_id'],
+      additionalProperties: false,
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'woc_click',
     description:
-      'Click at native X11 display coordinates (NOT scaled screenshot coordinates) inside a running WOC instance. Rejects if live display dimensions do not match display_width/display_height, if a human is viewing/controlling VNC, or if stopped. Clicking WeChat bottom-right Send button to bypass woc_draft_reply + woc_confirm_send is prohibited and blocked (send_button_click_blocked). Invalidates any pending drafts for this instance.',
+      'Click at native X11 display coordinates (NOT scaled screenshot coordinates) inside a running WOC instance. Rejects if live display dimensions do not match display_width/display_height, if a human is viewing/controlling VNC, or if stopped. Clicking WeChat bottom-right Send button to bypass woc_draft_reply + woc_confirm_send is prohibited and blocked (send_button_click_blocked). Invalidates any pending drafts for this instance before the click is dispatched, including when the click then fails or times out.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -327,7 +359,7 @@ export const MCP_WRITE_TOOLS: Tool[] = [
   {
     name: 'woc_scroll',
     description:
-      'Scroll at native X11 display coordinates inside a running WOC instance. Rejects if live display dimensions do not match display_width/display_height, if a human is viewing/controlling VNC, or if stopped. Invalidates any pending drafts for this instance.',
+      'Scroll at native X11 display coordinates inside a running WOC instance. Rejects if live display dimensions do not match display_width/display_height, if a human is viewing/controlling VNC, or if stopped. Invalidates any pending drafts for this instance before the scroll is dispatched, including when it then fails or times out.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -373,7 +405,7 @@ export const MCP_WRITE_TOOLS: Tool[] = [
   {
     name: 'woc_draft_reply',
     description:
-      'Clear any residual text in the active WeChat chat editor and paste draft reply text (focusChat=true, clearFirst=true, NEVER presses Return), capture an atomic header+editor grayscale fingerprint and post-paste verification screenshot, and return a short-lived single-use draft_id for woc_confirm_send.',
+      'Clear any residual text in the active WeChat chat editor and paste draft reply text (NEVER presses Return). Before pasting it checks that the chat header is not blank and, when expected_header_digest is given, that the open chat is still that one; otherwise nothing is pasted. Returns a post-paste screenshot, native-resolution crops of the header and of the input box, and a short-lived single-use draft_id for woc_confirm_send. Issuing a draft invalidates every older draft_id of the instance.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -386,6 +418,12 @@ export const MCP_WRITE_TOOLS: Tool[] = [
           minLength: 1,
           maxLength: MAX_DRAFT_TEXT_CHARS,
           description: `Draft message text to paste into WeChat editor (1..${MAX_DRAFT_TEXT_CHARS} chars; clears existing input first, never sent automatically).`,
+        },
+        expected_header_digest: {
+          type: 'string',
+          pattern: '^[0-9a-f]{32}$',
+          description:
+            'header_digest from woc_session_header for the chat this reply is meant for. If another chat is open, the call fails with session_header_mismatch and nothing is pasted. Strongly recommended: the chat list reorders whenever a message arrives.',
         },
         max_width: {
           type: 'integer',
@@ -406,7 +444,7 @@ export const MCP_WRITE_TOOLS: Tool[] = [
   {
     name: 'woc_confirm_send',
     description:
-      'Consume a single-use draft_id from woc_draft_reply, re-verify runtime/human-control/window geometry/header+editor fingerprints, and press Return once to send the drafted WeChat reply. Never retries on error and never re-pastes.',
+      'Consume a single-use draft_id from woc_draft_reply, re-verify runtime/human-control/window geometry/header+editor fingerprints (pixel-exact) and that the WeChat main window is still the active window, press Return once, then check that the draft left the input box. Returns send_verified=true only when that last check passed; send_unconfirmed means Return was pressed but the draft is still in the box. Never retries on error and never re-pastes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -499,7 +537,7 @@ class DraftStore {
     return entry;
   }
 
-  // Invalidate all unconsumed drafts for a specific instance (called after click/scroll/discard).
+  // Invalidate all unconsumed drafts for a specific instance (called before a click/scroll/discard is dispatched and before a new draft is pasted).
   invalidateInstance(instanceId: string): number {
     let count = 0;
     for (const [id, entry] of this.entries) {
@@ -686,6 +724,8 @@ function parseScreenshotArgs(args: Record<string, unknown>, allowCrop = true): S
 
 interface McpRuntimeState {
   allowWrite: boolean;
+  editorMaxDiffPixels: number | null;
+  confirmFocusCheck: boolean;
   draftStore: DraftStore;
   rateLimiter: WriteRateLimiter;
   now: () => number;
@@ -707,7 +747,89 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
     log(`[mcp-audit] ${JSON.stringify({ ts: new Date(state.now()).toISOString(), ...entry })}`);
   };
 
-  // Shared pre-execution guardrail for all 4 write tools.
+  const humanInControl = (inst: Instance): Record<string, unknown> | null => {
+    const viewers = deps.activeVncViewerCount(inst.id);
+    const controlLock = deps.getControlLock(inst.id);
+    if (viewers === 0 && !controlLock.active) return null;
+    return {
+      ok: false,
+      error: 'human_in_control',
+      instance_id: inst.id,
+      active_vnc_viewers: viewers,
+      control_lock: controlLock,
+      message: 'A human is currently viewing or controlling this instance; write action aborted.',
+    };
+  };
+
+  const withLock = <T>(inst: Instance, op: () => Promise<T>): Promise<T> =>
+    deps.withInputLock ? deps.withInputLock(inst, op) : op();
+  const isInputBusy = (e: any): boolean => e?.statusCode === 409;
+  const inputBusyPayload = (id: string) => ({
+    ok: false,
+    error: 'input_busy',
+    instance_id: id,
+    dispatched: 'no',
+    message: 'Another input operation is in progress on this instance; nothing was dispatched. Retry shortly.',
+  });
+
+  // Maps the known failure modes of click / scroll / clear to structured results; returns null for anything else.
+  const inputFailureResult = (tool: string, id: string, e: any, invalidatedDrafts: number, t0: number) => {
+    if (e instanceof DisplaySizeMismatchError) {
+      auditWrite({ tool, instance_id: id, result: 'rejected', error: 'display_size_mismatch', duration_ms: state.now() - t0 });
+      return jsonTextResult({
+        ok: false,
+        error: 'display_size_mismatch',
+        instance_id: id,
+        expected_display_width: e.expectedWidth,
+        expected_display_height: e.expectedHeight,
+        actual_display_width: e.actualWidth,
+        actual_display_height: e.actualHeight,
+        invalidated_drafts: invalidatedDrafts,
+      });
+    }
+    if (isInputBusy(e)) {
+      auditWrite({ tool, instance_id: id, result: 'rejected', error: 'input_busy', duration_ms: state.now() - t0 });
+      return jsonTextResult({ ...inputBusyPayload(id), invalidated_drafts: invalidatedDrafts });
+    }
+    if (e instanceof InputCommandError) {
+      auditWrite({ tool, instance_id: id, result: e.dispatched === 'no' ? 'rejected' : 'error', error: e.code, duration_ms: state.now() - t0 });
+      return jsonTextResult(
+        {
+          ok: false,
+          error: e.code,
+          instance_id: id,
+          dispatched: e.dispatched,
+          detail: e.message,
+          invalidated_drafts: invalidatedDrafts,
+          message:
+            e.dispatched === 'no'
+              ? 'Nothing was dispatched to the instance.'
+              : 'The input may have been partially dispatched. The in-container process was terminated, so nothing will fire late; take a screenshot before deciding what to do next.',
+        },
+        e.dispatched !== 'no',
+      );
+    }
+    return null;
+  };
+
+  const formatHeaderCheck = (m: HeaderCheckMetrics) => ({
+    match: m.match,
+    diff_pixels: m.diffPixels,
+    total_pixels: m.totalPixels,
+    mean_abs_diff: m.meanAbsDiff,
+  });
+  const formatEditorCheck = (m: EditorCheckMetrics) => ({
+    enforced: m.enforced,
+    match: m.match,
+    diff_pixels: m.diffPixels,
+    changed_pixels_20: m.changedPixels20,
+    total_pixels: m.totalPixels,
+    mean_abs_diff: m.meanAbsDiff,
+    changed_pixel_ratio: m.changedPixelRatio,
+    max_diff_pixels: m.maxDiffPixels,
+  });
+
+  // Shared pre-execution guardrail for all write tools.
   const checkWriteGuards = async (
     inst: Instance,
     isConfirmSend: boolean,
@@ -730,22 +852,8 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
       };
     }
 
-    const viewers = deps.activeVncViewerCount(inst.id);
-    const controlLock = deps.getControlLock(inst.id);
-    if (viewers > 0 || controlLock.active) {
-      return {
-        ok: false,
-        error: 'human_in_control',
-        payload: {
-          ok: false,
-          error: 'human_in_control',
-          instance_id: inst.id,
-          active_vnc_viewers: viewers,
-          control_lock: controlLock,
-          message: 'A human is currently viewing or controlling this instance; write action aborted.',
-        },
-      };
-    }
+    const human = humanInControl(inst);
+    if (human) return { ok: false, error: 'human_in_control', payload: human };
 
     const rate = state.rateLimiter.checkAndRecord(isConfirmSend);
     if (!rate.allowed) {
@@ -776,7 +884,7 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
         tools: {},
       },
       instructions: state.allowWrite
-        ? 'MCP server for WechatOnCloud (WOC) with controlled write tools enabled. Never assumes stopped instances can be started. Always inspect screenshot/window info before clicking; always review woc_draft_reply screenshot and obtain explicit user approval before calling woc_confirm_send.'
+        ? 'MCP server for WechatOnCloud (WOC) with controlled write tools enabled. Never assumes stopped instances can be started. Always inspect screenshot/window info before clicking; the chat list reorders whenever a message arrives, so never reuse old coordinates without a fresh screenshot. Before drafting, call woc_session_header, confirm from its image that the intended chat is open, and pass its header_digest to woc_draft_reply as expected_header_digest. Always review the woc_draft_reply images and obtain explicit user approval before calling woc_confirm_send.'
         : 'Read-only MCP server for WechatOnCloud (WOC). Never assumes stopped instances can be started; check runtime state first.',
     },
   );
@@ -801,8 +909,8 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
       toolName === 'woc_confirm_send' ||
       toolName === 'woc_discard_draft';
 
-    // Strict feature gate: when MCP_ALLOW_WRITE !== '1', write tools behave as unknown tools.
-    if (isWriteTool && !state.allowWrite) {
+    // Strict feature gate: when MCP_ALLOW_WRITE !== '1', write tools (and their read-only companion) behave as unknown tools.
+    if ((isWriteTool || toolName === 'woc_session_header') && !state.allowWrite) {
       log(`[mcp] tool=${toolName} instanceId=- durationMs=${state.now() - t0} ok=false reason=unknown_tool`);
       return jsonTextResult({ ok: false, error: 'unknown_tool', tool: toolName }, true);
     }
@@ -1084,6 +1192,51 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
         }
 
         // ---------- Phase 2 Controlled Write Tools (gated by MCP_ALLOW_WRITE=1) ----------
+        case 'woc_session_header': {
+          const id = requireInstanceId(args);
+          logInstanceId = id;
+          const inst = deps.findInstance(id);
+          if (!inst) {
+            log(`[mcp] tool=${toolName} instanceId=${id} durationMs=${state.now() - t0} ok=false reason=not_found`);
+            return jsonTextResult({ ok: false, error: 'instance_not_found', instance_id: id }, true);
+          }
+          const runtime = await deps.instanceRuntime(inst);
+          if (runtime !== 'running') {
+            log(`[mcp] tool=${toolName} instanceId=${id} runtime=${runtime} durationMs=${state.now() - t0} ok=false reason=instance_stopped`);
+            return jsonTextResult({
+              ok: false,
+              error: 'instance_stopped',
+              instance_id: inst.id,
+              runtime,
+              message: 'Instance is not running; cannot capture the chat header without starting the container.',
+            });
+          }
+          if (!deps.captureSessionFingerprint) throw new Error('captureSessionFingerprint handler not configured');
+          const fp = await deps.captureSessionFingerprint(inst);
+          const png = encodeGrayPng(fp.headerGray, fp.headerRegion.width, fp.headerRegion.height);
+          // Privacy: log metadata ONLY — never the header image or its digest.
+          log(`[mcp] tool=${toolName} instanceId=${id} headerInk=${fp.headerInkPixels} bytes=${png.length} durationMs=${state.now() - t0} ok=true`);
+          return {
+            content: [
+              { type: 'image' as const, data: png.toString('base64'), mimeType: 'image/png' },
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  ok: true,
+                  instance_id: inst.id,
+                  header_digest: fp.headerDigest,
+                  header_ink_pixels: fp.headerInkPixels,
+                  header_blank: fp.headerInkPixels < MIN_HEADER_INK_PIXELS,
+                  header_region: fp.headerRegion,
+                  display_width: fp.displayWidth,
+                  display_height: fp.displayHeight,
+                  wechat_window: fp.wechatWindow,
+                }),
+              },
+            ],
+          };
+        }
+
         case 'woc_click': {
           const id = requireInstanceId(args);
           logInstanceId = id;
@@ -1156,6 +1309,8 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
           }
 
           if (!deps.clickInInstance) throw new Error('clickInInstance handler not configured');
+          // Invalidate BEFORE dispatching: a click whose outcome is unknown must never leave a draft confirmable.
+          const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
           try {
             const actual = await deps.clickInInstance(inst, {
               x,
@@ -1165,7 +1320,6 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
               button,
               doubleClick,
             });
-            const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
             auditWrite({ tool: toolName, instance_id: id, result: 'ok', duration_ms: state.now() - t0 });
             return jsonTextResult({
               ok: true,
@@ -1179,18 +1333,8 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
               invalidated_drafts: invalidatedDrafts,
             });
           } catch (e: any) {
-            if (e instanceof DisplaySizeMismatchError) {
-              auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'display_size_mismatch', duration_ms: state.now() - t0 });
-              return jsonTextResult({
-                ok: false,
-                error: 'display_size_mismatch',
-                instance_id: id,
-                expected_display_width: e.expectedWidth,
-                expected_display_height: e.expectedHeight,
-                actual_display_width: e.actualWidth,
-                actual_display_height: e.actualHeight,
-              });
-            }
+            const failed = inputFailureResult(toolName, id, e, invalidatedDrafts, t0);
+            if (failed) return failed;
             throw e;
           }
         }
@@ -1258,6 +1402,7 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
           }
 
           if (!deps.scrollInInstance) throw new Error('scrollInInstance handler not configured');
+          const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
           try {
             const actual = await deps.scrollInInstance(inst, {
               x,
@@ -1267,7 +1412,6 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
               direction,
               clicks,
             });
-            const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
             auditWrite({ tool: toolName, instance_id: id, result: 'ok', duration_ms: state.now() - t0 });
             return jsonTextResult({
               ok: true,
@@ -1281,18 +1425,8 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
               invalidated_drafts: invalidatedDrafts,
             });
           } catch (e: any) {
-            if (e instanceof DisplaySizeMismatchError) {
-              auditWrite({ tool: toolName, instance_id: id, result: 'rejected', error: 'display_size_mismatch', duration_ms: state.now() - t0 });
-              return jsonTextResult({
-                ok: false,
-                error: 'display_size_mismatch',
-                instance_id: id,
-                expected_display_width: e.expectedWidth,
-                expected_display_height: e.expectedHeight,
-                actual_display_width: e.actualWidth,
-                actual_display_height: e.actualHeight,
-              });
-            }
+            const failed = inputFailureResult(toolName, id, e, invalidatedDrafts, t0);
+            if (failed) return failed;
             throw e;
           }
         }
@@ -1305,6 +1439,13 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
             throw new Error(`invalid_argument: text must be a non-empty string (<= ${MAX_DRAFT_TEXT_CHARS} chars)`);
           }
           const textLength = text.length;
+          let expectedDigest: string | undefined;
+          if (args.expected_header_digest !== undefined) {
+            if (typeof args.expected_header_digest !== 'string' || !/^[0-9a-f]{32}$/.test(args.expected_header_digest)) {
+              throw new Error('invalid_argument: expected_header_digest must be the 32-hex header_digest returned by woc_session_header');
+            }
+            expectedDigest = args.expected_header_digest;
+          }
           const shotOpts = parseScreenshotArgs(args, false);
 
           const inst = deps.findInstance(id);
@@ -1322,36 +1463,137 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
           if (!deps.typeInInstance || !deps.captureSessionFingerprint) {
             throw new Error('draft reply handlers not configured');
           }
+          const capture = deps.captureSessionFingerprint;
+          const typeText = deps.typeInInstance;
+          const rejectDraft = (error: string) =>
+            auditWrite({ tool: toolName, instance_id: id, text_length: textLength, result: 'rejected', error, duration_ms: state.now() - t0 });
 
-          // Focus active WeChat chat input, clear any residual text, and paste ONLY — NEVER press Return.
-          await deps.typeInInstance(inst, text, { focusChat: true, clearFirst: true, send: false });
-          const fingerprint = await deps.captureSessionFingerprint(inst);
-          if (fingerprint.headerInkPixels < MIN_HEADER_INK_PIXELS) {
-            auditWrite({
-              tool: toolName,
-              instance_id: id,
-              text_length: textLength,
-              result: 'rejected',
-              error: 'header_blank',
-              duration_ms: state.now() - t0,
+          let pasteAttempted = false;
+          let outcome:
+            | { kind: 'header_blank'; fp: SessionFingerprint }
+            | { kind: 'header_mismatch'; fp: SessionFingerprint }
+            | { kind: 'session_changed'; cmp: FingerprintComparison }
+            | { kind: 'ok'; fp: SessionFingerprint; shot: ScreenshotResult; invalidated: number };
+          try {
+            // Check, paste and re-check under ONE input lock so no other panel-driven input can slip in between.
+            outcome = await withLock(inst, async () => {
+              // Validate the open chat BEFORE touching its input box.
+              const pre = await capture(inst);
+              if (pre.headerInkPixels < MIN_HEADER_INK_PIXELS) return { kind: 'header_blank' as const, fp: pre };
+              if (expectedDigest && pre.headerDigest !== expectedDigest) return { kind: 'header_mismatch' as const, fp: pre };
+
+              // Pasting overwrites the input box, so any older draft_id for this instance is stale from here on.
+              const invalidated = state.draftStore.invalidateInstance(inst.id);
+              pasteAttempted = true;
+              // Focus active WeChat chat input, clear any residual text, and paste ONLY — NEVER press Return.
+              await typeText(inst, text, {
+                focusChat: true,
+                clearFirst: true,
+                send: false,
+                lockHeld: Boolean(deps.withInputLock),
+                killAfterSec: DRAFT_PASTE_KILL_AFTER_SEC,
+              });
+              const post = await capture(inst);
+              const cmp = compareSessionFingerprints(pre, post, { editorMaxDiffPixels: null });
+              if (!cmp.match) return { kind: 'session_changed' as const, cmp };
+              const shot = await deps.captureInstanceScreenshot(inst, shotOpts);
+              return { kind: 'ok' as const, fp: post, shot, invalidated };
             });
+          } catch (e: any) {
+            if (isInputBusy(e)) {
+              rejectDraft('input_busy');
+              return jsonTextResult(inputBusyPayload(id));
+            }
+            if (e instanceof InputCommandError && e.dispatched === 'no') {
+              rejectDraft(e.code);
+              return jsonTextResult({
+                ok: false,
+                error: e.code,
+                instance_id: id,
+                dispatched: 'no',
+                detail: e.message,
+                input_may_have_residual_draft: false,
+                message: 'Nothing was typed into the instance; no draft_id issued.',
+              });
+            }
+            if (pasteAttempted) {
+              const msg = e instanceof Error ? e.message : String(e);
+              auditWrite({ tool: toolName, instance_id: id, text_length: textLength, result: 'error', error: 'draft_failed_after_paste', duration_ms: state.now() - t0 });
+              return jsonTextResult(
+                {
+                  ok: false,
+                  error: 'draft_failed_after_paste',
+                  instance_id: id,
+                  detail: msg,
+                  ...RESIDUAL_DRAFT_META,
+                  message: 'The paste may have been (partially) applied but the draft could not be verified; no draft_id issued.',
+                },
+                true,
+              );
+            }
+            throw e;
+          }
+
+          if (outcome.kind === 'header_blank') {
+            rejectDraft('header_blank');
             return jsonTextResult({
               ok: false,
               error: 'header_blank',
               instance_id: inst.id,
-              header_ink_pixels: fingerprint.headerInkPixels,
+              header_ink_pixels: outcome.fp.headerInkPixels,
               min_header_ink_pixels: MIN_HEADER_INK_PIXELS,
-              header_region: fingerprint.headerRegion,
-              input_may_have_residual_draft: true,
-              discard_hint: 'Call woc_discard_draft to clear any residual text in the WeChat input box.',
+              header_region: outcome.fp.headerRegion,
+              input_may_have_residual_draft: false,
               message:
-                'WeChat chat header appears blank or obscured (insufficient title ink pixels); no draft_id issued.',
+                'WeChat chat header appears blank or obscured (insufficient title ink pixels); nothing was pasted and no draft_id issued.',
+            });
+          }
+          if (outcome.kind === 'header_mismatch') {
+            rejectDraft('session_header_mismatch');
+            const fp = outcome.fp;
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify({
+                    ok: false,
+                    error: 'session_header_mismatch',
+                    instance_id: inst.id,
+                    expected_header_digest: expectedDigest,
+                    actual_header_digest: fp.headerDigest,
+                    header_ink_pixels: fp.headerInkPixels,
+                    input_may_have_residual_draft: false,
+                    message:
+                      'The open chat is not the one pinned by expected_header_digest (the attached image is the header that is open now); nothing was pasted and no draft_id issued.',
+                  }),
+                },
+                {
+                  type: 'image' as const,
+                  data: encodeGrayPng(fp.headerGray, fp.headerRegion.width, fp.headerRegion.height).toString('base64'),
+                  mimeType: 'image/png',
+                },
+              ],
+            };
+          }
+          if (outcome.kind === 'session_changed') {
+            rejectDraft('session_changed_during_draft');
+            return jsonTextResult({
+              ok: false,
+              error: 'session_changed_during_draft',
+              instance_id: inst.id,
+              detail: outcome.cmp.detail,
+              header_check: formatHeaderCheck(outcome.cmp.headerCheck),
+              ...RESIDUAL_DRAFT_META,
+              message:
+                'The chat header or window changed while the draft was being pasted, so the text may sit in a different chat; no draft_id issued.',
             });
           }
 
-          const shot = await deps.captureInstanceScreenshot(inst, shotOpts);
+          const { fp: fingerprint, shot } = outcome;
           const draft = state.draftStore.create(inst.id, textLength, fingerprint);
           const ttlSec = Math.max(1, Math.round((draft.expiresAt - draft.createdAt) / 1000));
+          const headerPng = encodeGrayPng(fingerprint.headerGray, fingerprint.headerRegion.width, fingerprint.headerRegion.height);
+          const editorPng = encodeGrayPng(fingerprint.editorGray, fingerprint.editorRegion.width, fingerprint.editorRegion.height);
 
           auditWrite({ tool: toolName, instance_id: id, text_length: textLength, result: 'ok', duration_ms: state.now() - t0 });
           return {
@@ -1375,15 +1617,22 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
                   image_width: shot.imageWidth,
                   image_height: shot.imageHeight,
                   bytes: shot.bytes,
+                  images: ['screenshot', 'header_native', 'editor_native'],
+                  invalidated_drafts: outcome.invalidated,
                   fingerprint_summary: {
                     digest: fingerprint.digest,
+                    header_digest: fingerprint.headerDigest,
                     header_ink_pixels: fingerprint.headerInkPixels,
+                    editor_ink_pixels: countHeaderInkPixels(fingerprint.editorGray).inkPixels,
                     header_region: fingerprint.headerRegion,
                     editor_region: fingerprint.editorRegion,
                   },
                   wechat_window: shot.wechatWindow,
                 }),
               },
+              // Native 1:1 crops of exactly the bytes woc_confirm_send will compare pixel-for-pixel.
+              { type: 'image' as const, data: headerPng.toString('base64'), mimeType: 'image/png' },
+              { type: 'image' as const, data: editorPng.toString('base64'), mimeType: 'image/png' },
             ],
           };
         }
@@ -1396,10 +1645,7 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
             throw new Error('invalid_argument: draft_id must be a non-empty string');
           }
 
-          const residualMeta = {
-            input_may_have_residual_draft: true,
-            discard_hint: 'Call woc_discard_draft to clear any residual text in the WeChat input box.',
-          };
+          const residualMeta = RESIDUAL_DRAFT_META;
 
           // Atomically consume draft_id immediately so it can NEVER be replayed/retried.
           const draft = state.draftStore.consume(draftId.trim());
@@ -1448,112 +1694,200 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
             return jsonTextResult({ ...guard.payload, ...residualMeta });
           }
 
-          if (!deps.captureSessionFingerprint || !deps.keyInInstance) {
+          if (!deps.captureSessionFingerprint || !deps.sendReturnInInstance) {
             throw new Error('confirm send handlers not configured');
           }
+          const capture = deps.captureSessionFingerprint;
+          const sendReturn = deps.sendReturnInInstance;
 
           const maxSamples = Math.max(1, deps.confirmMaxSamples ?? DEFAULT_CONFIRM_MAX_SAMPLES);
           const sampleDelayMs = Math.max(0, deps.confirmSampleDelayMs ?? DEFAULT_CONFIRM_SAMPLE_DELAY_MS);
+          const settleMs = Math.max(0, deps.postSendSettleMs ?? DEFAULT_POST_SEND_SETTLE_MS);
           const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-          const editorMaxDiff =
-            deps.editorMaxDiffPixels === undefined ? DEFAULT_EDITOR_MAX_DIFF_PIXELS : deps.editorMaxDiffPixels;
+          const editorMaxDiff = state.editorMaxDiffPixels;
+          const auditConfirm = (result: 'ok' | 'rejected' | 'error', error?: string) =>
+            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result, ...(error ? { error } : {}), duration_ms: state.now() - t0 });
 
-          let samplesTaken = 0;
-          let finalCmp: FingerprintComparison | null = null;
-          let bestCmp: FingerprintComparison | null = null;
-
-          for (let attempt = 1; attempt <= maxSamples; attempt++) {
-            if (attempt > 1 && sampleDelayMs > 0) {
-              await sleep(sampleDelayMs);
-            }
-            const liveFp = await deps.captureSessionFingerprint(inst);
-            const attemptCmp = compareSessionFingerprints(draft.fingerprint, liveFp, {
-              editorMaxDiffPixels: editorMaxDiff,
-            });
-            samplesTaken = attempt;
-
-            // Geometry or header mismatch aborts immediately on ANY sample (zero tolerance).
-            if (
-              attemptCmp.reason === 'window_geometry_mismatch' ||
-              attemptCmp.reason === 'session_fingerprint_mismatch'
-            ) {
-              finalCmp = attemptCmp;
-              break;
-            }
-
-            if (!bestCmp || attemptCmp.editorCheck.diffPixels < bestCmp.editorCheck.diffPixels) {
-              bestCmp = attemptCmp;
-            }
-
-            // Early exit as soon as header matches (0px) and editor diff is within threshold.
-            if (attemptCmp.match) {
-              finalCmp = attemptCmp;
-              break;
-            }
-          }
-
-          const cmp = finalCmp ?? bestCmp!;
-          const formatHeaderCheck = (m: HeaderCheckMetrics) => ({
-            match: m.match,
-            diff_pixels: m.diffPixels,
-            total_pixels: m.totalPixels,
-            mean_abs_diff: m.meanAbsDiff,
-          });
-          const formatEditorCheck = (m: EditorCheckMetrics) => ({
-            enforced: m.enforced,
-            match: m.match,
-            diff_pixels: m.diffPixels,
-            changed_pixels_20: m.changedPixels20,
-            total_pixels: m.totalPixels,
-            mean_abs_diff: m.meanAbsDiff,
-            changed_pixel_ratio: m.changedPixelRatio,
-            max_diff_pixels: m.maxDiffPixels,
-          });
-          if (!cmp.match) {
-            const errCode = cmp.reason ?? 'session_fingerprint_mismatch';
-            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'rejected', error: errCode, duration_ms: state.now() - t0 });
-            return jsonTextResult({
-              ok: false,
-              error: errCode,
-              instance_id: id,
-              detail: cmp.detail,
-              samples_taken: samplesTaken,
-              header_check: formatHeaderCheck(cmp.headerCheck),
-              editor_check: formatEditorCheck(cmp.editorCheck),
-              ...residualMeta,
-              message: 'Active chat window, header, or editor changed since draft; send aborted and draft consumed.',
-            });
-          }
-
-          // Send ONE Return key — NEVER re-paste and NEVER auto-retry on failure.
+          let returnAttempted = false;
           try {
-            await deps.keyInInstance(inst, 'Return');
+            // Verification, the single Return key and the post-send check all run under ONE input lock,
+            // so no other panel-driven click / scroll / paste can land between "verified" and "sent".
+            return await withLock(inst, async () => {
+              let samplesTaken = 0;
+              let finalCmp: FingerprintComparison | null = null;
+              let bestCmp: FingerprintComparison | null = null;
+
+              for (let attempt = 1; attempt <= maxSamples; attempt++) {
+                if (attempt > 1 && sampleDelayMs > 0) {
+                  await sleep(sampleDelayMs);
+                }
+                const liveFp = await capture(inst);
+                const attemptCmp = compareSessionFingerprints(draft.fingerprint, liveFp, {
+                  editorMaxDiffPixels: editorMaxDiff,
+                });
+                samplesTaken = attempt;
+
+                // Geometry or header mismatch aborts immediately on ANY sample (zero tolerance).
+                if (
+                  attemptCmp.reason === 'window_geometry_mismatch' ||
+                  attemptCmp.reason === 'session_fingerprint_mismatch'
+                ) {
+                  finalCmp = attemptCmp;
+                  break;
+                }
+
+                if (!bestCmp || attemptCmp.editorCheck.diffPixels < bestCmp.editorCheck.diffPixels) {
+                  bestCmp = attemptCmp;
+                }
+
+                // Early exit as soon as header matches (0px) and editor diff is within threshold.
+                if (attemptCmp.match) {
+                  finalCmp = attemptCmp;
+                  break;
+                }
+              }
+
+              const cmp = finalCmp ?? bestCmp!;
+              if (!cmp.match) {
+                const errCode = cmp.reason ?? 'session_fingerprint_mismatch';
+                auditConfirm('rejected', errCode);
+                return jsonTextResult({
+                  ok: false,
+                  error: errCode,
+                  instance_id: id,
+                  detail: cmp.detail,
+                  samples_taken: samplesTaken,
+                  header_check: formatHeaderCheck(cmp.headerCheck),
+                  editor_check: formatEditorCheck(cmp.editorCheck),
+                  ...residualMeta,
+                  message: 'Active chat window, header, or editor changed since draft; send aborted and draft consumed.',
+                });
+              }
+
+              // Sampling takes up to ~1.3s: re-check right before the key press that a human did not arrive meanwhile.
+              const human = humanInControl(inst);
+              if (human) {
+                auditConfirm('rejected', 'human_in_control');
+                return jsonTextResult({ ...human, sent: false, ...residualMeta });
+              }
+
+              // Send ONE Return key — NEVER re-paste and NEVER auto-retry on failure.
+              returnAttempted = true;
+              try {
+                await sendReturn(inst, draft.fingerprint.wechatWindow.id, { focusCheck: state.confirmFocusCheck });
+              } catch (e: any) {
+                if (e instanceof InputCommandError && e.dispatched === 'no') {
+                  auditConfirm('rejected', e.code);
+                  return jsonTextResult({
+                    ok: false,
+                    error: e.code,
+                    instance_id: id,
+                    sent: false,
+                    detail: e.message,
+                    ...residualMeta,
+                    message:
+                      'Return was NOT pressed (for focus_mismatch: the WeChat main window is no longer the active window, e.g. a dialog took focus); draft consumed.',
+                  });
+                }
+                const msg = e instanceof Error ? e.message : String(e);
+                auditConfirm('error', 'send_uncertain_no_retry');
+                return jsonTextResult(
+                  {
+                    ok: false,
+                    error: 'send_uncertain_no_retry',
+                    instance_id: id,
+                    detail: msg,
+                    ...residualMeta,
+                    message: 'Return key dispatch failed or timed out; draft was consumed and will NOT be auto-retried. Inspect a screenshot before retrying manually.',
+                  },
+                  true,
+                );
+              }
+
+              // Post-send check: the message left the input box only if the editor no longer matches the draft in ANY frame.
+              let postSend: 'verified' | 'editor_unchanged' | 'inconclusive' = 'inconclusive';
+              let postSendDetail: string | undefined;
+              let postSamples = 0;
+              try {
+                if (settleMs > 0) await sleep(settleMs);
+                let everyFrameDiffers = true;
+                for (let attempt = 1; attempt <= maxSamples; attempt++) {
+                  if (attempt > 1 && sampleDelayMs > 0) await sleep(sampleDelayMs);
+                  const afterFp = await capture(inst);
+                  postSamples = attempt;
+                  const afterCmp = compareSessionFingerprints(draft.fingerprint, afterFp, {
+                    editorMaxDiffPixels: editorMaxDiff ?? 0,
+                  });
+                  if (afterCmp.reason === 'window_geometry_mismatch' || afterCmp.reason === 'session_fingerprint_mismatch') {
+                    everyFrameDiffers = false;
+                    postSendDetail = 'chat header or window changed right after Return';
+                    break;
+                  }
+                  if (afterCmp.match) {
+                    everyFrameDiffers = false;
+                    postSend = 'editor_unchanged';
+                    break;
+                  }
+                }
+                if (everyFrameDiffers) postSend = 'verified';
+              } catch (e: any) {
+                postSend = 'inconclusive';
+                postSendDetail = `post-send capture failed: ${e instanceof Error ? e.message : String(e)}`;
+              }
+
+              const sendChecks = {
+                samples_taken: samplesTaken,
+                header_check: formatHeaderCheck(cmp.headerCheck),
+                editor_check: formatEditorCheck(cmp.editorCheck),
+                post_send: { result: postSend, samples_taken: postSamples, ...(postSendDetail ? { detail: postSendDetail } : {}) },
+              };
+              if (postSend === 'editor_unchanged') {
+                auditConfirm('error', 'send_unconfirmed');
+                return jsonTextResult({
+                  ok: false,
+                  error: 'send_unconfirmed',
+                  instance_id: id,
+                  return_dispatched: true,
+                  text_length: draft.textLength,
+                  ...sendChecks,
+                  ...residualMeta,
+                  message:
+                    'Return was pressed once but the input box still shows the draft, so the message was probably NOT sent (e.g. WeChat is set to send with Ctrl+Enter). Not retried; inspect a screenshot.',
+                });
+              }
+
+              auditConfirm('ok');
+              return jsonTextResult({
+                ok: true,
+                sent: true,
+                send_verified: postSend === 'verified',
+                instance_id: id,
+                text_length: draft.textLength,
+                ...sendChecks,
+              });
+            });
           } catch (e: any) {
+            // Everything after the key press is handled above, so reaching here means Return was not pressed.
+            if (returnAttempted) throw e;
+            if (isInputBusy(e)) {
+              auditConfirm('rejected', 'input_busy');
+              return jsonTextResult({ ...inputBusyPayload(id), sent: false, ...residualMeta });
+            }
             const msg = e instanceof Error ? e.message : String(e);
-            auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'error', error: 'send_uncertain_no_retry', duration_ms: state.now() - t0 });
+            auditConfirm('error', 'confirm_check_failed');
             return jsonTextResult(
               {
                 ok: false,
-                error: 'send_uncertain_no_retry',
+                error: 'confirm_check_failed',
                 instance_id: id,
+                sent: false,
                 detail: msg,
                 ...residualMeta,
-                message: 'Return key dispatch failed or timed out; draft was consumed and will NOT be auto-retried. Inspect a screenshot before retrying manually.',
+                message: 'Verification could not be completed; Return was NOT pressed and the draft was consumed.',
               },
               true,
             );
           }
-
-          auditWrite({ tool: toolName, instance_id: id, text_length: draft.textLength, result: 'ok', duration_ms: state.now() - t0 });
-          return jsonTextResult({
-            ok: true,
-            sent: true,
-            instance_id: id,
-            text_length: draft.textLength,
-            samples_taken: samplesTaken,
-            header_check: formatHeaderCheck(cmp.headerCheck),
-            editor_check: formatEditorCheck(cmp.editorCheck),
-          });
         }
 
         case 'woc_discard_draft': {
@@ -1576,7 +1910,13 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
           }
 
           const invalidatedDrafts = state.draftStore.invalidateInstance(inst.id);
-          await deps.clearInputInInstance(inst);
+          try {
+            await deps.clearInputInInstance(inst);
+          } catch (e: any) {
+            const failed = inputFailureResult(toolName, id, e, invalidatedDrafts, t0);
+            if (failed) return failed;
+            throw e;
+          }
           auditWrite({ tool: toolName, instance_id: id, result: 'ok', duration_ms: state.now() - t0 });
           return jsonTextResult({
             ok: true,
@@ -1604,6 +1944,14 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
   return server;
 }
 
+// MCP_EDITOR_MAX_DIFF_PIXELS: optional calibration override for the editor fingerprint tolerance.
+export function parseEditorMaxDiffEnv(raw: string | undefined): number | undefined | 'invalid' {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  if (!/^[0-9]{1,6}$/.test(raw.trim())) return 'invalid';
+  const n = Number(raw.trim());
+  return n <= MAX_EDITOR_MAX_DIFF_PIXELS ? n : 'invalid';
+}
+
 export function registerMcp(app: FastifyInstance, deps: McpDeps): { enabled: boolean; allowWrite: boolean } {
   const token = (deps.authToken ?? process.env.MCP_AUTH_TOKEN ?? '').trim();
   const allowWrite = deps.allowWrite !== undefined ? deps.allowWrite === true : process.env.MCP_ALLOW_WRITE === '1';
@@ -1615,8 +1963,22 @@ export function registerMcp(app: FastifyInstance, deps: McpDeps): { enabled: boo
   }
 
   const now = deps.now ?? (() => Date.now());
+  const envEditorMax = parseEditorMaxDiffEnv(process.env.MCP_EDITOR_MAX_DIFF_PIXELS);
+  if (envEditorMax === 'invalid') {
+    log(`[mcp] ignoring invalid MCP_EDITOR_MAX_DIFF_PIXELS (expected integer 0..${MAX_EDITOR_MAX_DIFF_PIXELS}); using default ${DEFAULT_EDITOR_MAX_DIFF_PIXELS}`);
+  }
+  const editorMaxDiffPixels =
+    deps.editorMaxDiffPixels !== undefined
+      ? deps.editorMaxDiffPixels
+      : typeof envEditorMax === 'number'
+        ? envEditorMax
+        : DEFAULT_EDITOR_MAX_DIFF_PIXELS;
+  const confirmFocusCheck =
+    deps.confirmFocusCheck !== undefined ? deps.confirmFocusCheck : process.env.MCP_CONFIRM_FOCUS_CHECK !== '0';
   const state: McpRuntimeState = {
     allowWrite,
+    editorMaxDiffPixels,
+    confirmFocusCheck,
     draftStore: new DraftStore({ ttlMs: deps.draftTtlMs, now }),
     rateLimiter: new WriteRateLimiter(deps.rateLimits, now),
     now,
@@ -1692,6 +2054,10 @@ export function registerMcp(app: FastifyInstance, deps: McpDeps): { enabled: boo
     }
   });
 
-  log(`[mcp] Streamable HTTP endpoint enabled at POST /mcp (allowWrite=${allowWrite})`);
+  log(
+    `[mcp] Streamable HTTP endpoint enabled at POST /mcp (allowWrite=${allowWrite}` +
+      (allowWrite ? `, editorMaxDiffPixels=${editorMaxDiffPixels}, confirmFocusCheck=${confirmFocusCheck}` : '') +
+      ')',
+  );
   return { enabled: true, allowWrite };
 }

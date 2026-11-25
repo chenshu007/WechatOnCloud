@@ -66,6 +66,8 @@ import {
   readClipboardImage,
   typeInInstance,
   clearInputInInstance,
+  sendReturnInInstance,
+  withInstanceInputLock,
   keyInInstance,
   listOrphanVolumes,
   removeVolume,
@@ -1500,7 +1502,8 @@ registerMcp(app, {
   scrollInInstance,
   typeInInstance,
   clearInputInInstance,
-  keyInInstance,
+  sendReturnInInstance,
+  withInputLock: withInstanceInputLock,
   captureSessionFingerprint,
   effectiveLimits: (inst) => effectiveLimits(inst),
   activeVncViewerCount,
@@ -1621,7 +1624,16 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
 
 // 探测面板网络 + 重启后把已登记实例的容器拉起来
 await ensureNetwork().catch(() => {});
+// WOC_BOOT_NO_AUTOSTART：逗号分隔的实例 ID。面板启动时不去拉起这些实例，保持它们当时的运行 / 停止状态
+// （例如下班后故意停掉的号，不该因为面板升级、回滚或重启被顺带上线）。之后仍可在面板里手动启动。
+const BOOT_NO_AUTOSTART = new Set(
+  (process.env.WOC_BOOT_NO_AUTOSTART || '').split(',').map((s) => s.trim()).filter(Boolean),
+);
 for (const pub of listInstances()) {
+  if (BOOT_NO_AUTOSTART.has(pub.id)) {
+    app.log.info(`[instance] WOC_BOOT_NO_AUTOSTART：启动时跳过实例 ${pub.id}，保持其当前状态`);
+    continue;
+  }
   try {
     await ensureRunning(findInstance(pub.id)!);
   } catch (e: any) {

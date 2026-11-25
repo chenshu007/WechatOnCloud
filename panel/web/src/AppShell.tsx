@@ -23,9 +23,14 @@ function useInstancesLoader(): InstancesState {
   const [instances, setInstances] = useState<InstanceWithStatus[]>([]);
   const [loaded, setLoaded] = useState(false);
   const timer = useRef<number | undefined>(undefined);
+  const issued = useRef(0);
+  const applied = useRef(0);
   const reload = async () => {
+    const seq = ++issued.current;
     try {
       const { instances } = await api.listInstances();
+      if (seq < applied.current) return;
+      applied.current = seq;
       setInstances(instances);
     } catch {
       /* 401 会被 api 层重定向到登录 */

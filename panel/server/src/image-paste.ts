@@ -37,6 +37,6 @@ for i in {1..20}; do
 done
 [ "$ready" = 1 ] || exit 1
 rm -f -- "$2"
-timeout 5 xdotool keyup Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift
+timeout 5 xdotool keyup --delay 0 Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift
 timeout 5 xdotool key ctrl+v
 `;

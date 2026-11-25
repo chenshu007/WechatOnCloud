@@ -237,11 +237,25 @@ async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): P
   const image = opts?.keepImage ? info!.Image : WECHAT_IMAGE;
   // Resolve the image before removing anything. Failed pulls leave the old
   // container intact; restarts never contact a registry or follow a mutable tag.
-  if (opts?.keepImage) await docker.getImage(image).inspect();
-  else await ensureImage();
+  // 容器在用的镜像可能已不在本机（例如同名 tag 被新镜像覆盖导致旧镜像 ID 消失）：
+  // 遇到 404 时改为原地重启，不删旧容器，同样不换版本（移植自上游 2e1ea60）。
+  if (opts?.keepImage) {
+    try {
+      await docker.getImage(image).inspect();
+    } catch (e: any) {
+      if (e?.statusCode === 404) {
+        await restartInPlace(inst, existing, image);
+        return;
+      }
+      throw e;
+    }
+  } else {
+    await ensureImage();
+  }
   if (info) {
     // 删除前先把旧容器最后日志快照进持久日志，否则随容器删除就看不到"上次为何停/崩"。
     await snapshotContainerLog(inst, '容器重建（重启/升级/自愈），保留上一容器最后日志');
+    await stopGracefully(existing);
     await existing.remove({ force: true });
   }
   // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
@@ -311,15 +325,56 @@ async function runInstanceNow(inst: Instance, opts?: { keepImage?: boolean }): P
   }
 }
 
+// 原地重启（镜像已不在本机、没法重建时用，移植自上游 2e1ea60）。先清掉 X 显示锁再重启容器。
+async function restartInPlace(inst: Instance, c: Docker.Container, image: string): Promise<void> {
+  appendInstanceLog(inst.id, `原镜像 ${image.replace(/^sha256:/, '').slice(0, 12)} 已不在本机（同名镜像被更新过），改为原地重启容器`);
+  await execCapture(inst, ['sh', '-c', 'rm -f /tmp/.X[0-9]*-lock'], 'root').catch(() => {});
+  await c.restart({ t: STOP_GRACE_SEC } as any);
+  appendInstanceLog(inst.id, '容器已原地重启');
+}
+
+// 启动时等 Docker 可用（socket-proxy 晚到几秒时避免启动流程落空，移植自上游 b0ff007）。
+export async function waitForDocker(maxMs = 30_000): Promise<boolean> {
+  const host = (process.env.DOCKER_HOST || '').trim();
+  if (!host && !existsSync('/var/run/docker.sock')) return false;
+  if (host.startsWith('unix://') && !existsSync(host.slice('unix://'.length))) return false;
+  const t0 = Date.now();
+  let lastErr: any;
+  while (Date.now() - t0 < maxMs) {
+    try {
+      await docker.ping();
+    } catch (e: any) {
+      lastErr = e;
+      if (!e?.statusCode) {
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+    }
+    const waited = Date.now() - t0;
+    if (waited > 1500) appendPanelLog('INFO', `等了 ${Math.round(waited / 1000)} 秒才连上 Docker（socket-proxy 刚启动？）`);
+    return true;
+  }
+  appendPanelLog(
+    'ERROR',
+    `${Math.round(maxMs / 1000)} 秒内连不上 Docker（${lastErr?.message || lastErr}），实例相关功能暂不可用；请检查 docker.sock 挂载或 socket-proxy 容器`,
+  );
+  return false;
+}
+
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
+// 只有容器确实不存在（404）才新建：Docker 一时连不上时直接报错，避免误重建（移植自上游 b0ff007）。
 export async function ensureRunning(inst: Instance): Promise<void> {
   requireSupportedApp(inst);
   try {
     const c = docker.getContainer(inst.containerName);
     const info = await c.inspect();
     if (!info.State?.Running) await c.start();
-  } catch {
-    await runInstance(inst);
+  } catch (e: any) {
+    if (e?.statusCode === 404) {
+      await runInstance(inst);
+      return;
+    }
+    throw e;
   }
 }
 
@@ -351,10 +406,20 @@ export async function regenInstanceMachineId(inst: Instance): Promise<void> {
   await runInstance(inst, { keepImage: true });
 }
 
+// 先正常停止容器再删除，避免直接 remove({ force: true }) SIGKILL 微信导致数据未落盘（移植自上游 7bba05f）。
+const STOP_GRACE_SEC = 10;
+async function stopGracefully(c: Docker.Container): Promise<void> {
+  try {
+    await c.stop({ t: STOP_GRACE_SEC } as any);
+  } catch {
+    /* 已停止 / 不存在：照常往下删 */
+  }
+}
+
 // 停止实例容器（保留容器与数据卷，可再启动）。
 export async function stopInstance(inst: Instance): Promise<void> {
   try {
-    await docker.getContainer(inst.containerName).stop({ t: 5 } as any);
+    await docker.getContainer(inst.containerName).stop({ t: STOP_GRACE_SEC } as any);
     appendInstanceLog(inst.id, '容器已停止');
   } catch {
     /* 已停止或不存在 */
@@ -364,6 +429,7 @@ export async function stopInstance(inst: Instance): Promise<void> {
 export async function removeInstance(inst: Instance, purgeVolume: boolean): Promise<void> {
   try {
     const c = docker.getContainer(inst.containerName);
+    if (!purgeVolume) await stopGracefully(c); // 数据卷还要留着用：让应用把数据写完再走
     await c.remove({ force: true });
   } catch {
     /* 容器可能已不存在 */
@@ -600,6 +666,9 @@ export interface WechatStatus {
 }
 
 const DEFAULT_STATUS: WechatStatus = { phase: 'idle', percent: 0, installed: false, version: '', message: '未安装', updatedAt: 0 };
+// 读状态偶尔失败时 60 秒内沿用上次状态，避免桌面页误判「未安装」而卸载重连 iframe（移植自上游 2e1ea60）。
+const STATUS_GRACE_MS = 60_000;
+const lastStatus = new Map<string, { st: WechatStatus; at: number }>();
 
 export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
   if (instanceAppType(inst) === 'chromium') {
@@ -613,10 +682,12 @@ export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
       '-c',
       `if [ -x /woc/app-ctl.sh ]; then /woc/app-ctl.sh ${at} status; else /woc/wechat-ctl.sh status; fi`,
     ]);
-    const json = JSON.parse(raw.trim());
-    return { ...DEFAULT_STATUS, ...json };
+    const st: WechatStatus = { ...DEFAULT_STATUS, ...JSON.parse(raw.trim()) };
+    lastStatus.set(inst.id, { st, at: Date.now() });
+    return st;
   } catch {
-    return DEFAULT_STATUS;
+    const last = lastStatus.get(inst.id);
+    return last && Date.now() - last.at < STATUS_GRACE_MS ? last.st : DEFAULT_STATUS;
   }
 }
 
@@ -1045,7 +1116,8 @@ export async function pasteImageInInstance(inst: Instance, mime: string, content
 // Ctrl+V，这时用户往往还按着 Ctrl：xdotool 按完后用它自己的虚拟键盘（XTEST）把 Ctrl 按回去，而用户松手是从 VNC 键盘
 // 来的，XTEST 这边的 Ctrl 就一直按着。下一次 xdotool 再按 Ctrl 被当成重复按键吞掉，应用收到的是光秃秃的 v——
 // 粘完图片接着打中文，发出去的是「v」。先 keyup 一遍既能清掉这种残留（包括旧版本留下的），又不会再按回去。
-export const XDO_RELEASE_MODS = 'xdotool keyup Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift';
+// --delay 0 避免 xdotool 对 11 个修饰键逐个默认 sleep 12ms（提速 ~150ms，移植自上游 5400c86）。
+export const XDO_RELEASE_MODS = 'xdotool keyup --delay 0 Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift';
 const xdoKey = (key: string) => `${XDO_RELEASE_MODS}\nxdotool key ${key}`;
 
 // 「锁定当前会话」：粘贴前先把焦点送进微信主窗口当前会话的输入框，不再依赖用户事先点好光标

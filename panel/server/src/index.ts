@@ -7,7 +7,7 @@ import httpProxy from 'http-proxy';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { IncomingMessage } from 'node:http';
+import type { ClientRequest, IncomingMessage } from 'node:http';
 import type { Socket } from 'node:net';
 import {
   initStore,
@@ -39,6 +39,7 @@ import {
   type Instance,
 } from './store.js';
 import {
+  waitForDocker,
   ensureNetwork,
   ensureRunning,
   runInstance,
@@ -802,12 +803,26 @@ app.post('/api/instances/:id/control/take', async (req, reply) => {
   return { mine: true, holder: u.username };
 });
 
+// 操作控制权门禁（移植自上游 4f8c0ec）：输入条/按键/粘贴图片同样受控制权约束；空闲或本人持有时自动续约，
+// 他人持有时返回 409，避免只读方通过输入接口向正在操作的桌面送字。
+function requireControl(id: string, u: User, reply: any, extra?: Record<string, unknown>): boolean {
+  const now = Date.now();
+  const h = controlHolders.get(id);
+  if (h && now - h.at <= CONTROL_TTL && h.userId !== u.id) {
+    reply.code(409).send({ error: `「${h.username}」正在操作该实例，请先在桌面点「申请控制」`, ...extra });
+    return false;
+  }
+  controlHolders.set(id, { userId: u.id, username: u.username, at: now });
+  return true;
+}
+
 // 通过 xdotool 在实例容器内输入文字（绕过 VNC XKB keysym 容量限制，修复中文 IME 吞字）
 app.post('/api/instances/:id/type', async (req, reply) => {
   const u = requireAuth(req, reply);
   if (!u) return;
   const id = (req.params as any).id;
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  if (!requireControl(id, u, reply)) return;
   const { text, focusChat, send } = (req.body as any) ?? {};
   if (!text || typeof text !== 'string' || text.length > 500) return reply.code(400).send({ error: '文字为空或过长' });
   try {
@@ -841,6 +856,7 @@ app.post('/api/instances/:id/paste-image', async (req, reply) => {
   if ((declaredLength(req) ?? 0) > MAX_PASTE_IMAGE_BYTES) return reply.code(413).send({ error: '图片过大', outcome: 'not-started' });
   const id = (req.params as any).id;
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例', outcome: 'not-started' });
+  if (!requireControl(id, u, reply, { outcome: 'not-started' })) return;
   const inst = findInstance(id);
   if (!inst) return reply.code(404).send({ error: '实例不存在', outcome: 'not-started' });
   const mime = (req.query as any)?.type;
@@ -862,6 +878,7 @@ app.post('/api/instances/:id/key', async (req, reply) => {
   if (!u) return;
   const id = (req.params as any).id;
   if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  if (!requireControl(id, u, reply)) return;
   const { key } = (req.body as any) ?? {};
   if (!key || typeof key !== 'string') return reply.code(400).send({ error: '按键名为空' });
   try {
@@ -1373,7 +1390,14 @@ const stuckHealer = createStuckHealer({
   },
 });
 
+// 转发给实例前去掉浏览器带来的 Cookie（移植自上游 d9caf3a，#179）：
+// 同 IP / 域名下其它 NAS 服务种的 Cookie 超过实例 nginx 8KB 单头上限会报 400，且实例只认注入的 Basic auth。
+function scrubUpstreamHeaders(proxyReq: ClientRequest) {
+  proxyReq.removeHeader('cookie');
+}
+
 proxy.on('proxyReq', (proxyReq, req, res) => {
+  scrubUpstreamHeaders(proxyReq);
   const auth = (req as any)._wocAuth;
   if (auth) proxyReq.setHeader('authorization', auth);
   // 只盯 noVNC 页面本身：它出不来 = 实例服务卡住。其余资源 / 音频长轮询不计。
@@ -1381,6 +1405,7 @@ proxy.on('proxyReq', (proxyReq, req, res) => {
   if (instId && (req.url || '').startsWith('/vnc/index.html')) stuckHealer.watch(proxyReq, instId, '桌面页面', res);
 });
 proxy.on('proxyReqWs', (proxyReq, req, socket) => {
+  scrubUpstreamHeaders(proxyReq);
   req.socket?.setKeepAlive(true, 30_000);
   proxyReq.on('socket', (upstreamSocket: Socket) => upstreamSocket.setKeepAlive(true, 30_000));
   const auth = (req as any)._wocAuth;
@@ -1389,13 +1414,19 @@ proxy.on('proxyReqWs', (proxyReq, req, socket) => {
   // 卡死时这条不会出现（接收器停止 accept），即可定位"卡在面板→实例之间还是实例内部"。
   const instId = (req as any)._wocInstId;
   if (instId) {
-    proxyReq.on('upgrade', () => {
+    // 只盯 VNC 连接本身（/websockify）；音频桥等其它 ws 不计
+    const isVnc = (req.url || '').startsWith('/websockify');
+    proxyReq.on('upgrade', (_res: IncomingMessage, proxySocket: Socket) => {
       trackActiveVncSocket(instId, req.socket as Socket);
       appendInstanceLog(instId, '[vnc] 上游已接受(101) · 桌面连接建立');
+      (req.socket as Socket).once('close', () => proxySocket.destroy());
+      if (isVnc) stuckHealer.watchGreeting(proxySocket, socket as Socket, instId);
     });
-    // 只盯 VNC 连接本身（/websockify）；音频桥等其它 ws 不计
-    if ((req.url || '').startsWith('/websockify')) {
+    if (isVnc) {
       stuckHealer.watch(proxyReq, instId, '桌面连接（websocket 升级）', socket, () => socket.destroy());
+      proxyReq.once('response', (res: IncomingMessage) => {
+        if ((res.statusCode || 0) >= 500) void stuckHealer.onDown(instId, `HTTP ${res.statusCode}`);
+      });
     }
   }
 });
@@ -1619,9 +1650,14 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
   socket.on('close', () => appendInstanceLog(inst.id, `[vnc] 连接关闭（持续 ${Math.round((Date.now() - t0) / 1000)}s）`));
   proxy.ws(req, socket, head, { target: instanceTarget(inst) }, (err: any) => {
     appendInstanceLog(inst.id, `[vnc] 连接失败：${err?.message || err}`);
+    if (err?.code === 'ECONNREFUSED' && (req.url || '').startsWith('/websockify')) {
+      void stuckHealer.onDown(inst.id, '拒绝连接');
+    }
   });
 });
 
+// 等待 Docker 就绪（socket-proxy 晚到几秒时避免启动探测落空，移植自上游 b0ff007）
+await waitForDocker();
 // 探测面板网络 + 重启后把已登记实例的容器拉起来
 await ensureNetwork().catch(() => {});
 // WOC_BOOT_NO_AUTOSTART：逗号分隔的实例 ID。面板启动时不去拉起这些实例，保持它们当时的运行 / 停止状态

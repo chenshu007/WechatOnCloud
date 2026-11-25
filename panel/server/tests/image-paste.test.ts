@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import Docker from 'dockerode';
 import { validatePasteImage, withInstanceInput, IMAGE_PASTE_SCRIPT, PasteError } from '../src/image-paste.js';
 // 先松开 xdotool 自己可能按住的修饰键、再不带 --clearmodifiers 地按（上游 31c5146：粘图后下一条文字变成「v」）
-const RELEASE = 'keyup Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift';
+const RELEASE = 'keyup --delay 0 Control_L Control_R Shift_L Shift_R Alt_L Alt_R Meta_L Meta_R Super_L Super_R ISO_Level3_Shift';
 import { installImagePasteBridge } from '../../web/src/image-paste-bridge.ts';
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jV1kAAAAASUVORK5CYII=','base64');
 test('image MIME, signatures, size and unsupported formats are checked',()=>{

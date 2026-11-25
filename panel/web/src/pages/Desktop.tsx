@@ -1,7 +1,7 @@
 import { installImagePasteBridge } from '../image-paste-bridge';
 import { fatalErrorMsg, isExtensionErrorEvent } from '../vnc-errors';
 import { installSeamlessIme } from '../seamless-ime';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, appProfile } from '../api';
 import { useUI } from '../ui';
@@ -390,23 +390,27 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     };
   }, [showVnc, id]);
 
+  const beat = useCallback(async () => {
+    if (!id) return;
+    const now = Date.now();
+    if (now - lastBeat.current < 2500) return;
+    lastBeat.current = now;
+    try {
+      const r = await api.controlBeat(id);
+      setControl({ free: false, mine: r.mine, holder: r.holder });
+    } catch {
+      /* ignore */
+    }
+  }, [id]);
+  const readOnly = !!control && !control.free && !control.mine;
+
   // 用户在 VNC 内真实操作（鼠标/键盘/滚轮）时续约控制权（同源 iframe 可监听）。节流 2.5s。
   // 只读用户的操作已被遮罩拦截/失焦，不会误续约；空闲不操作则超时自动释放。
   useEffect(() => {
     if (!showVnc || !id || !frameLoaded) return;
     const win = frameRef.current?.contentWindow;
     if (!win) return;
-    const onInteract = async () => {
-      const now = Date.now();
-      if (now - lastBeat.current < 2500) return;
-      lastBeat.current = now;
-      try {
-        const r = await api.controlBeat(id);
-        setControl({ free: false, mine: r.mine, holder: r.holder });
-      } catch {
-        /* ignore */
-      }
-    };
+    const onInteract = () => void beat();
     const evs = ['mousedown', 'keydown', 'wheel'] as const;
     try {
       evs.forEach((e) => win.addEventListener(e, onInteract, { capture: true, passive: true }));
@@ -420,7 +424,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         /* ignore */
       }
     };
-  }, [showVnc, id, frameLoaded, frameGeneration]);
+  }, [showVnc, id, frameLoaded, frameGeneration, beat]);
 
   // 进入/重连桌面前，按输入模式设 KasmVNC 的 enable_ime（iframe 同源共享 localStorage，加载前设好即生效）。
   //   无感（seamless）：enable_ime=true，启用 noVNC 合成 textarea；中文 keysym 已被容器补丁抑制，
@@ -515,11 +519,11 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (recovering.current || !id) return;
     recovering.current = true;
     if (allowAutoRecover(id)) {
-      api.clientLog(id, `KasmVNC 致命错误，自动重连：${msg}`);
+      api.clientLog(id, `桌面连接异常，自动整页重连：${msg}`);
       toast('桌面连接异常，正在自动重连…', 'error');
       window.setTimeout(() => window.location.reload(), 800);
     } else {
-      api.clientLog(id, `KasmVNC 反复致命错误，停止自动重连、转手动恢复：${msg}`);
+      api.clientLog(id, `桌面连接反复异常，停止自动重连、转手动恢复：${msg}`);
       setFrameLoaded(false);
       setLoadStuck(true); // 露出"桌面无响应"浮层，由用户「重新连接/重启实例」
       recovering.current = false;
@@ -532,6 +536,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   useEffect(() => {
     if (!showVnc || !frameLoaded || !id) return;
     let lastState = '';
+    let disconnectedTicks = 0;
     const t = window.setInterval(() => {
       const doc = frameRef.current?.contentDocument;
       const fatal = fatalErrorMsg(doc, onExtensionError, onReconnectGap);
@@ -558,6 +563,15 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       if (state && state !== lastState) {
         lastState = state;
         api.clientLog(id, `VNC状态→${state}`);
+      }
+      // 停在 disconnected（约 6s）说明 noVNC 不会再自己重连（#175，移植自上游 a6f916f），走同一套自愈重连。
+      if (state === 'disconnected') {
+        if (++disconnectedTicks >= 2) {
+          disconnectedTicks = 0;
+          recoverFromFatal('桌面连接已断开，且不会自动重连');
+        }
+      } else {
+        disconnectedTicks = 0;
       }
     }, 3000);
     return () => window.clearInterval(t);
@@ -1302,26 +1316,32 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               <textarea
                 className="iv-imebar-input"
                 value={imeText}
+                disabled={readOnly}
                 onChange={(e) => setImeText(e.target.value)}
                 onKeyDown={(e) => {
+                  void beat();
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault();
                     sendImeText();
                   }
                 }}
-                placeholder={autoEnter
-                  ? '回车将填入并发送到应用。Shift+回车换行。'
-                  : '回车只填入应用输入框；确认内容后请在应用内发送。Shift+回车换行。'}
+                placeholder={
+                  readOnly
+                    ? `「${control?.holder}」正在操作，你当前为只读；要操作请点桌面上的「申请控制」`
+                    : autoEnter
+                      ? '回车将填入并发送到应用。Shift+回车换行。'
+                      : '回车只填入应用输入框；确认内容后请在应用内发送。Shift+回车换行。'
+                }
                 rows={1}
               />
               <label>
-                <input type="checkbox" checked={autoEnter} disabled={imeSending}
+                <input type="checkbox" checked={autoEnter} disabled={imeSending || readOnly}
                   onChange={(e) => setAutoEnter(e.target.checked)} />
                 自动回车发送
               </label>
               <button
                 className="btn btn-primary iv-imebar-send"
-                disabled={imeSending || !imeText.trim()}
+                disabled={imeSending || !imeText.trim() || readOnly}
                 onClick={sendImeText}
               >
                 {imeSending ? '处理中' : autoEnter ? '填入并发送' : '填入'}

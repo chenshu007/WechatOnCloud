@@ -1522,4 +1522,359 @@ export function instanceTarget(inst: Instance): string {
   return `http://${inst.containerName}:3000`;
 }
 
+// ---------- 只读 MCP 辅助能力（docker ping / X11 窗口信息 / 内存 PNG 截屏） ----------
+export const MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024; // 4 MiB 硬上限，防大帧撑爆内存
+
+export interface WindowRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface WechatWindowRect extends WindowRect {
+  id: string;
+  title: string;
+}
+
+export interface WechatWindowInfo {
+  display: string;
+  displayWidth: number;
+  displayHeight: number;
+  wechatWindow: WechatWindowRect | null;
+}
+
+export interface ScreenshotCrop {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface ScreenshotOptions {
+  maxWidth?: number; // 默认 1280；0 表示原生分辨率不缩放
+  crop?: ScreenshotCrop; // 原生屏幕坐标，按显示尺寸裁剪
+}
+
+export interface ScreenshotResult {
+  png: Buffer;
+  displayWidth: number;
+  displayHeight: number;
+  imageWidth: number;
+  imageHeight: number;
+  maxWidth: number;
+  crop: ScreenshotCrop | null;
+  wechatWindow: WechatWindowRect | null;
+  bytes: number;
+  durationMs: number;
+}
+
+// 探测 docker-socket-proxy / Docker daemon 连通性（只读 ping，不抛错）。
+export async function dockerHealthy(timeoutMs = 3000): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      docker.ping(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('docker ping timeout')), timeoutMs);
+      }),
+    ]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// 解析 PNG IHDR 宽高并校验 PNG 魔数（前 24 字节）。
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+export function parsePngDimensions(buf: Buffer): { width: number; height: number } {
+  if (!Buffer.isBuffer(buf) || buf.length < 24 || !buf.subarray(0, 8).equals(PNG_MAGIC)) {
+    throw new Error('截屏输出不是有效的 PNG 图片');
+  }
+  if (buf.toString('ascii', 12, 16) !== 'IHDR') {
+    throw new Error('PNG 缺少 IHDR 头');
+  }
+  const width = buf.readUInt32BE(16);
+  const height = buf.readUInt32BE(20);
+  if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+    throw new Error(`PNG 尺寸非法：${width}x${height}`);
+  }
+  return { width, height };
+}
+
+// 校验并按屏幕边界裁剪截屏区域（原生像素坐标）。
+export function clampScreenshotCrop(
+  crop: ScreenshotCrop,
+  displayWidth: number,
+  displayHeight: number,
+): ScreenshotCrop {
+  if (
+    !crop ||
+    !Number.isFinite(crop.x) ||
+    !Number.isFinite(crop.y) ||
+    !Number.isFinite(crop.width) ||
+    !Number.isFinite(crop.height)
+  ) {
+    throw new Error('crop 参数必须是有限数字 { x, y, width, height }');
+  }
+  if (crop.width <= 0 || crop.height <= 0) {
+    throw new Error('crop 的 width 和 height 必须大于 0');
+  }
+  const x = Math.min(Math.max(0, Math.round(crop.x)), displayWidth - 1);
+  const y = Math.min(Math.max(0, Math.round(crop.y)), displayHeight - 1);
+  const width = Math.min(Math.max(1, Math.round(crop.width)), displayWidth - x);
+  const height = Math.min(Math.max(1, Math.round(crop.height)), displayHeight - y);
+  return { x, y, width, height };
+}
+
+// 解析 WECHAT_WINDOW_INFO_SCRIPT 输出。
+export function parseWechatWindowInfo(raw: string): WechatWindowInfo {
+  let display = ':1';
+  let displayWidth = 0;
+  let displayHeight = 0;
+  let wechatWindow: WechatWindowRect | null = null;
+
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trimEnd();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('DISPLAY\t')) {
+      const parts = trimmed.split('\t');
+      if (parts.length >= 4) {
+        display = parts[1] || ':1';
+        displayWidth = Number(parts[2]) || 0;
+        displayHeight = Number(parts[3]) || 0;
+      }
+    } else if (trimmed.startsWith('WINDOW\t')) {
+      const parts = trimmed.split('\t');
+      if (parts.length >= 7) {
+        const x = Number(parts[2]);
+        const y = Number(parts[3]);
+        const width = Number(parts[4]);
+        const height = Number(parts[5]);
+        if (Number.isFinite(x) && Number.isFinite(y) && width > 0 && height > 0) {
+          wechatWindow = {
+            id: parts[1],
+            x,
+            y,
+            width,
+            height,
+            title: parts.slice(6).join('\t'),
+          };
+        }
+      }
+    }
+  }
+
+  if (displayWidth <= 0 || displayHeight <= 0) {
+    throw new Error('无法获取实例 X11 显示分辨率');
+  }
+  return { display, displayWidth, displayHeight, wechatWindow };
+}
+
+const WECHAT_WINDOW_INFO_SCRIPT = [
+  'set -eu',
+  'display="${DISPLAY:-}"',
+  'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
+  'export DISPLAY="${display:-:1}"',
+  'sw=""; sh=""',
+  'if command -v xdotool >/dev/null 2>&1; then read -r sw sh <<<"$(xdotool getdisplaygeometry 2>/dev/null || true)"; fi',
+  'if [ -z "$sw" ] || [ -z "$sh" ]; then',
+  '  read -r sw sh <<<"$(xdpyinfo 2>/dev/null | awk \'/dimensions:/ {split($2,a,"x"); print a[1], a[2]; exit}\')"',
+  'fi',
+  'printf "DISPLAY\\t%s\\t%s\\t%s\\n" "$DISPLAY" "${sw:-0}" "${sh:-0}"',
+  'if command -v xdotool >/dev/null 2>&1; then',
+  '  best_pref=0; best_area=0; best_id=""; best_x=0; best_y=0; best_w=0; best_h=0; best_title=""',
+  '  ids="$(xdotool search --onlyvisible --class \'^wechat$\' 2>/dev/null || xdotool search --onlyvisible --class \'wechat\' 2>/dev/null || true)"',
+  '  for c in $ids; do',
+  '    X=0; Y=0; WIDTH=0; HEIGHT=0',
+  '    eval "$(xdotool getwindowgeometry --shell "$c" 2>/dev/null | grep -E \'^(X|Y|WIDTH|HEIGHT)=-?[0-9]+$\' || true)"',
+  '    [ "${WIDTH:-0}" -gt 0 ] && [ "${HEIGHT:-0}" -gt 0 ] || continue',
+  '    title="$(xdotool getwindowname "$c" 2>/dev/null | tr \'\\r\\n\\t\' \'   \' || true)"',
+  '    pref=0',
+  '    case "$title" in 微信|Weixin|WeChat) pref=1 ;; esac',
+  '    area=$((WIDTH * HEIGHT))',
+  '    if [ "$pref" -gt "$best_pref" ] || { [ "$pref" -eq "$best_pref" ] && [ "$area" -gt "$best_area" ]; }; then',
+  '      best_pref=$pref; best_area=$area; best_id=$c; best_x=$X; best_y=$Y; best_w=$WIDTH; best_h=$HEIGHT; best_title=$title',
+  '    fi',
+  '  done',
+  '  if [ -n "$best_id" ]; then',
+  '    printf "WINDOW\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$best_id" "$best_x" "$best_y" "$best_w" "$best_h" "$best_title"',
+  '  fi',
+  'fi',
+].join('\n');
+
+// 查询运行中实例的 X11 显示尺寸与微信主窗口几何信息（只读，不启动容器）。
+export async function wechatWindowInfo(inst: Instance): Promise<WechatWindowInfo> {
+  const out = await execCapture(inst, ['bash', '-c', WECHAT_WINDOW_INFO_SCRIPT], 'abc', 8000);
+  return parseWechatWindowInfo(out);
+}
+
+// 收集 docker exec 多路复用流中的原始 stdout 字节（供 execCaptureBuffer 使用并可独立单测）。
+// 关键：在 TCP docker-socket-proxy 上，hijacked socket 往往在 'end' 后立即触发 'close'，
+// 此时 exec.inspect() 仍在异步等待中；必须同步置 ended=true，避免 'close' 误判为异常中断。
+export function collectDemuxedStream(
+  stream: NodeJS.EventEmitter & { destroy: () => void },
+  demux: (
+    s: any,
+    stdout: { write: (b: Buffer) => void },
+    stderr: { write: (b: Buffer) => void },
+  ) => void,
+  inspectExec: () => Promise<{ Running?: boolean; ExitCode?: number | null }>,
+  opts: { timeoutMs?: number; maxBytes?: number } = {},
+): Promise<Buffer> {
+  const timeoutMs = opts.timeoutMs ?? 10000;
+  const maxBytes = opts.maxBytes ?? MAX_SCREENSHOT_BYTES;
+  return new Promise<Buffer>((resolve, reject) => {
+    let settled = false;
+    let ended = false;
+    let totalBytes = 0;
+    const outChunks: Buffer[] = [];
+    let err = '';
+    const errDecoder = new StringDecoder('utf8');
+
+    const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      stream.destroy();
+      reject(e);
+    };
+
+    const timer = timeoutMs
+      ? setTimeout(() => fail(new Error('截屏执行超时')), timeoutMs)
+      : undefined;
+
+    const stdout = {
+      write: (b: Buffer) => {
+        if (settled) return;
+        totalBytes += b.length;
+        if (totalBytes > maxBytes) {
+          fail(new Error(`截屏结果超出上限（>${maxBytes} 字节）`));
+          return;
+        }
+        outChunks.push(Buffer.from(b));
+      },
+    };
+    const stderr = {
+      write: (b: Buffer) => {
+        if (err.length < 4096) err += errDecoder.write(b);
+      },
+    };
+
+    demux(stream, stdout, stderr);
+    stream.on('close', () => {
+      if (!ended && !settled) fail(new Error('截屏连接异常中断'));
+    });
+    stream.on('end', async () => {
+      ended = true;
+      if (settled) return;
+      err += errDecoder.end();
+      try {
+        const info = await inspectExec();
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (info.Running || info.ExitCode == null) {
+          reject(new Error('无法确认截屏进程已结束'));
+          return;
+        }
+        if (info.ExitCode !== 0) {
+          reject(new Error((err || `截屏命令失败，退出码 ${info.ExitCode}`).trim()));
+          return;
+        }
+        resolve(Buffer.concat(outChunks));
+      } catch (e: any) {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+    stream.on('error', (e: any) => fail(e instanceof Error ? e : new Error(String(e))));
+  });
+}
+
+// 在实例容器内执行命令并直接收集原始二进制 stdout（用于内存截屏，带超时和字节上限）。
+async function execCaptureBuffer(
+  inst: Instance,
+  cmd: string[],
+  user = 'abc',
+  timeoutMs = 10000,
+  maxBytes = MAX_SCREENSHOT_BYTES,
+): Promise<Buffer> {
+  const c = docker.getContainer(inst.containerName);
+  const exec = await execCreate(c, { Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: user });
+  const stream = await exec.start({ hijack: true, stdin: false });
+  return collectDemuxedStream(
+    stream,
+    (s, stdout, stderr) => docker.modem.demuxStream(s, stdout as any, stderr as any),
+    () => exec.inspect(),
+    { timeoutMs, maxBytes },
+  );
+}
+
+const SCREENSHOT_CAPTURE_SCRIPT = [
+  'set -eu',
+  'display="$1"; cap_w="$2"; cap_h="$3"; cap_x="$4"; cap_y="$5"; scale_w="$6"',
+  'export DISPLAY="$display"',
+  'command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg not installed in instance image" >&2; exit 127; }',
+  'if [ "$scale_w" -gt 0 ] && [ "$cap_w" -gt "$scale_w" ]; then',
+  '  exec ffmpeg -loglevel error -f x11grab -video_size "${cap_w}x${cap_h}" -i "${display}+${cap_x},${cap_y}" -vframes 1 -vf "scale=${scale_w}:-1" -f image2pipe -vcodec png -',
+  'else',
+  '  exec ffmpeg -loglevel error -f x11grab -video_size "${cap_w}x${cap_h}" -i "${display}+${cap_x},${cap_y}" -vframes 1 -f image2pipe -vcodec png -',
+  'fi',
+].join('\n');
+
+// 内存截屏：单次 docker exec 经 ffmpeg x11grab 输出 PNG 流，不落盘、不打印图片内容。
+export async function captureInstanceScreenshot(
+  inst: Instance,
+  opts: ScreenshotOptions = {},
+): Promise<ScreenshotResult> {
+  const t0 = Date.now();
+  const winInfo = await wechatWindowInfo(inst);
+  const clampedCrop = opts.crop
+    ? clampScreenshotCrop(opts.crop, winInfo.displayWidth, winInfo.displayHeight)
+    : null;
+  const rect = clampedCrop ?? { x: 0, y: 0, width: winInfo.displayWidth, height: winInfo.displayHeight };
+  const maxWidth = opts.maxWidth === undefined ? 1280 : Math.max(0, Math.round(opts.maxWidth));
+  if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
+    throw new Error('实例 DISPLAY 名称非法');
+  }
+
+  const png = await execCaptureBuffer(
+    inst,
+    [
+      'bash',
+      '-c',
+      SCREENSHOT_CAPTURE_SCRIPT,
+      'woc-screenshot',
+      winInfo.display,
+      String(rect.width),
+      String(rect.height),
+      String(rect.x),
+      String(rect.y),
+      String(maxWidth),
+    ],
+    'abc',
+    10000,
+    MAX_SCREENSHOT_BYTES,
+  );
+
+  const dims = parsePngDimensions(png);
+  return {
+    png,
+    displayWidth: winInfo.displayWidth,
+    displayHeight: winInfo.displayHeight,
+    imageWidth: dims.width,
+    imageHeight: dims.height,
+    maxWidth,
+    crop: clampedCrop,
+    wechatWindow: winInfo.wechatWindow,
+    bytes: png.length,
+    durationMs: Date.now() - t0,
+  };
+}
+
 export { WECHAT_IMAGE };

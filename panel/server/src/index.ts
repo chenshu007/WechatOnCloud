@@ -47,6 +47,9 @@ import {
   removeInstance as removeInstanceContainer,
   instanceRuntime,
   instanceUptimeSec,
+  dockerHealthy,
+  wechatWindowInfo,
+  captureInstanceScreenshot,
   triggerWechat,
   wechatStatus,
   instanceTarget,
@@ -100,6 +103,7 @@ import { GiB, MiB, declaredLength, readBody, receiveFile, spoolUpload, cleanSpoo
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 import { createVncRejectLimiter, type VncRejectReason } from './vnc-reject.js';
 import { createStuckHealer } from './stuck-heal.js';
+import { registerMcp } from './mcp.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -1470,6 +1474,36 @@ const desktopHandler = (req: FastifyRequest, reply: FastifyReply) => {
 app.all('/desktop/:id', desktopHandler);
 app.all('/desktop/:id/*', desktopHandler);
 
+// ---------- 只读 MCP 端点（POST /mcp；未设 MCP_AUTH_TOKEN 时默认完全禁用） ----------
+registerMcp(app, {
+  allowedHosts: ALLOWED_HOSTS,
+  panelVersion: CURRENT_VERSION,
+  buildRevision: BUILD_REVISION || null,
+  dockerHealthy,
+  listInstances,
+  findInstance,
+  instanceRuntime,
+  instanceUptimeSec,
+  instanceMemoryMB,
+  instanceHttpHealthy,
+  wechatStatus,
+  instanceLogs,
+  readInstanceLog,
+  listInstanceFiles,
+  wechatWindowInfo,
+  captureInstanceScreenshot,
+  effectiveLimits: (inst) => effectiveLimits(inst),
+  activeVncViewerCount,
+  getControlLock: (id) => {
+    const h = controlHolders.get(id);
+    if (!h) return { active: false, holder: null, ageMs: null };
+    const ageMs = Date.now() - h.at;
+    if (ageMs > CONTROL_TTL) return { active: false, holder: null, ageMs: null };
+    return { active: true, holder: h.username, ageMs };
+  },
+  hasActiveSession: (id) => hasActiveSession(id),
+});
+
 // ---------- 静态 SPA + 前端路由回退 ----------
 function setStaticCacheHeaders(reply: FastifyReply, pathName: string) {
   if (
@@ -1499,7 +1533,13 @@ await app.register(fstatic, {
 });
 app.setNotFoundHandler((req, reply) => {
   const url = req.raw.url || '';
-  if (url.startsWith('/api') || url.startsWith('/desktop')) {
+  if (
+    url.startsWith('/api') ||
+    url.startsWith('/desktop') ||
+    url === '/mcp' ||
+    url.startsWith('/mcp/') ||
+    url.startsWith('/mcp?')
+  ) {
     return reply.code(404).send({ error: 'not found' });
   }
   return sendSpaIndex(reply);

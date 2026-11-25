@@ -12,7 +12,10 @@ import {
   compareSessionFingerprints,
   DisplaySizeMismatchError,
   isInSendButtonZone,
+  MIN_HEADER_INK_PIXELS,
   type ClickOptions,
+  type EditorCheckMetrics,
+  type HeaderCheckMetrics,
   type MouseButton,
   type RuntimeState,
   type ScreenshotCrop,
@@ -88,6 +91,7 @@ export interface McpDeps {
   getControlLock: (id: string) => ControlLockInfo;
   hasActiveSession: (id: string) => boolean;
   draftTtlMs?: number;
+  editorMaxDiffPixels?: number | null;
   rateLimits?: WriteRateLimitConfig;
   now?: () => number;
   log?: (line: string) => void;
@@ -1315,6 +1319,29 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
           // Focus active WeChat chat input, clear any residual text, and paste ONLY — NEVER press Return.
           await deps.typeInInstance(inst, text, { focusChat: true, clearFirst: true, send: false });
           const fingerprint = await deps.captureSessionFingerprint(inst);
+          if (fingerprint.headerInkPixels < MIN_HEADER_INK_PIXELS) {
+            auditWrite({
+              tool: toolName,
+              instance_id: id,
+              text_length: textLength,
+              result: 'rejected',
+              error: 'header_blank',
+              duration_ms: state.now() - t0,
+            });
+            return jsonTextResult({
+              ok: false,
+              error: 'header_blank',
+              instance_id: inst.id,
+              header_ink_pixels: fingerprint.headerInkPixels,
+              min_header_ink_pixels: MIN_HEADER_INK_PIXELS,
+              header_region: fingerprint.headerRegion,
+              input_may_have_residual_draft: true,
+              discard_hint: 'Call woc_discard_draft to clear any residual text in the WeChat input box.',
+              message:
+                'WeChat chat header appears blank or obscured (insufficient title ink pixels); no draft_id issued.',
+            });
+          }
+
           const shot = await deps.captureInstanceScreenshot(inst, shotOpts);
           const draft = state.draftStore.create(inst.id, textLength, fingerprint);
           const ttlSec = Math.max(1, Math.round((draft.expiresAt - draft.createdAt) / 1000));
@@ -1343,8 +1370,7 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
                   bytes: shot.bytes,
                   fingerprint_summary: {
                     digest: fingerprint.digest,
-                    header_dhash: fingerprint.headerDhash,
-                    editor_dhash: fingerprint.editorDhash,
+                    header_ink_pixels: fingerprint.headerInkPixels,
                     header_region: fingerprint.headerRegion,
                     editor_region: fingerprint.editorRegion,
                   },
@@ -1420,12 +1446,24 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
           }
 
           const liveFp = await deps.captureSessionFingerprint(inst);
-          const cmp = compareSessionFingerprints(draft.fingerprint, liveFp);
-          const formatRegionCheck = (m: typeof cmp.headerCheck) => ({
+          const cmp = compareSessionFingerprints(draft.fingerprint, liveFp, {
+            editorMaxDiffPixels: deps.editorMaxDiffPixels ?? null,
+          });
+          const formatHeaderCheck = (m: HeaderCheckMetrics) => ({
             match: m.match,
-            hamming_distance: m.hammingDistance,
+            diff_pixels: m.diffPixels,
+            total_pixels: m.totalPixels,
+            mean_abs_diff: m.meanAbsDiff,
+          });
+          const formatEditorCheck = (m: EditorCheckMetrics) => ({
+            enforced: m.enforced,
+            match: m.match,
+            diff_pixels: m.diffPixels,
+            changed_pixels_20: m.changedPixels20,
+            total_pixels: m.totalPixels,
             mean_abs_diff: m.meanAbsDiff,
             changed_pixel_ratio: m.changedPixelRatio,
+            max_diff_pixels: m.maxDiffPixels,
           });
           if (!cmp.match) {
             const errCode = cmp.reason ?? 'session_fingerprint_mismatch';
@@ -1435,8 +1473,8 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
               error: errCode,
               instance_id: id,
               detail: cmp.detail,
-              header_check: formatRegionCheck(cmp.headerCheck),
-              editor_check: formatRegionCheck(cmp.editorCheck),
+              header_check: formatHeaderCheck(cmp.headerCheck),
+              editor_check: formatEditorCheck(cmp.editorCheck),
               ...residualMeta,
               message: 'Active chat window, header, or editor changed since draft; send aborted and draft consumed.',
             });
@@ -1467,8 +1505,8 @@ function createMcpServer(deps: McpDeps, state: McpRuntimeState): Server {
             sent: true,
             instance_id: id,
             text_length: draft.textLength,
-            header_check: formatRegionCheck(cmp.headerCheck),
-            editor_check: formatRegionCheck(cmp.editorCheck),
+            header_check: formatHeaderCheck(cmp.headerCheck),
+            editor_check: formatEditorCheck(cmp.editorCheck),
           });
         }
 

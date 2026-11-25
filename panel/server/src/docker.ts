@@ -2075,11 +2075,12 @@ export function isInSendButtonZone(x: number, y: number, win: WechatWindowRect |
   );
 }
 
-// ---------- 微信 4.1.1.8 会话标题栏 + 输入区轻量灰度指纹（零落盘、单帧原子采集、防串窗与防篡改草稿） ----------
-export const FINGERPRINT_GRID_W = 64;
-export const FINGERPRINT_GRID_H = 16;
-export const FINGERPRINT_RAW_BYTES = FINGERPRINT_GRID_W * FINGERPRINT_GRID_H; // 1024 B per region
-export const FINGERPRINT_COMBINED_BYTES = FINGERPRINT_RAW_BYTES * 2; // 2048 B (header + editor vstacked)
+// ---------- 微信 4.1.1.8 原生 1:1 标题栏 + 解耦输入区灰度指纹（零落盘、单帧原子采集） ----------
+export const EDITOR_FINGERPRINT_HEIGHT = 32;
+export const HEADER_INK_DELTA = 20;
+// 实测 1836x884「文件传输助手」(6 汉字)在 280x44 原生标题区占 721 px (|px-bg|>=20)；
+// 2 汉字约 240 px，取 75 px 作为防空白下限，兼顾细笔画短名且稳定拦截空白标题栏。
+export const MIN_HEADER_INK_PIXELS = 75;
 
 export interface SessionFingerprint {
   displayWidth: number;
@@ -2087,31 +2088,41 @@ export interface SessionFingerprint {
   wechatWindow: WechatWindowRect;
   headerRegion: ScreenshotCrop;
   editorRegion: ScreenshotCrop;
-  headerGray: Buffer; // 64x16 8-bit grayscale (1024 bytes), strictly in-memory
-  editorGray: Buffer; // 64x16 8-bit grayscale (1024 bytes), strictly in-memory
-  headerDhash: string; // 64-bit horizontal dHash (16 hex chars)
-  editorDhash: string; // 64-bit horizontal dHash (16 hex chars)
+  headerGray: Buffer; // native 1:1 grayscale (headerRegion.width * headerRegion.height bytes), strictly in-memory
+  editorGray: Buffer; // scaled grayscale (headerRegion.width * 32 bytes), strictly in-memory
+  headerInkPixels: number;
+  headerBg: number;
   digest: string; // 16-hex-char SHA-256 summary for metadata/logging
 }
 
-export interface RegionCheckMetrics {
+export interface HeaderCheckMetrics {
   match: boolean;
-  hammingDistance: number;
+  diffPixels: number;
+  totalPixels: number;
+  meanAbsDiff: number;
+}
+
+export interface EditorCheckMetrics {
+  enforced: boolean;
+  match: boolean;
+  diffPixels: number;
+  changedPixels20: number;
+  totalPixels: number;
   meanAbsDiff: number;
   changedPixelRatio: number;
+  maxDiffPixels: number | null;
 }
 
 export interface FingerprintComparison {
   match: boolean;
   reason?: 'window_geometry_mismatch' | 'session_fingerprint_mismatch' | 'editor_fingerprint_mismatch';
   detail?: string;
-  headerCheck: RegionCheckMetrics;
-  editorCheck: RegionCheckMetrics;
+  headerCheck: HeaderCheckMetrics;
+  editorCheck: EditorCheckMetrics;
 }
 
-// 基于微信 Linux 4.1.1.8 实测布局计算当前会话标题栏裁剪区：
-// 左侧导航栏 + 会话列表总宽约 350-356px（可拖拽），标题文字从主窗口 x+355 附近起始，顶部 y+6..y+64，
-// 右侧留出 140px 避开窗控/更多按钮。窗口过小时返回 null（安全拒绝）。
+// 基于微信 Linux 4.1.1.8 实测布局计算当前会话标题核心裁剪区（1836x884 下精确为 {x:355,y:12,w:280,h:44}）：
+// 左侧栏分隔线在 x=352，x=355 留出 3px 安全间隔，标题文字实测落在相对 (14,22)..(109,37)。
 export function computeHeaderRegion(
   win: WechatWindowRect,
   displayWidth: number,
@@ -2120,10 +2131,12 @@ export function computeHeaderRegion(
   if (win.width < 480 || win.height < 300) return null;
   const sidebarOffset = win.width >= 900 ? 355 : Math.round(win.width * 0.32);
   const rawX = win.x + sidebarOffset;
-  const rawY = win.y + 6;
+  const rawY = win.y + 12;
   const maxRight = Math.min(displayWidth, win.x + win.width - 140);
-  const rawW = Math.min(520, maxRight - rawX);
-  const rawH = Math.min(58, Math.max(24, Math.round(win.height * 0.08)));
+  const availW = maxRight - rawX;
+  if (availW < 80) return null;
+  const rawW = Math.min(280, Math.max(120, availW));
+  const rawH = Math.min(44, Math.max(24, Math.round(win.height * 0.06)));
   if (rawW < 80 || rawH < 16) return null;
   const clamped = clampScreenshotCrop(
     { x: rawX, y: rawY, width: rawW, height: rawH },
@@ -2156,92 +2169,49 @@ export function computeEditorRegion(
   return clamped;
 }
 
-// 计算 64x16 灰度图的 64-bit 水平差分哈希（9x8 区块均值比较）。
-export function computeGrayscaleDHash(
-  gray: Buffer,
-  width = FINGERPRINT_GRID_W,
-  height = FINGERPRINT_GRID_H,
-): string {
-  if (!Buffer.isBuffer(gray) || gray.length !== width * height) {
-    throw new Error(`灰度指纹缓冲大小异常：期望 ${width * height} 字节，实际 ${gray?.length ?? 0}`);
-  }
-  const cols = 9;
-  const rows = 8;
-  const grid = new Float64Array(cols * rows);
-  for (let r = 0; r < rows; r++) {
-    const y0 = Math.floor((r * height) / rows);
-    const y1 = Math.max(y0 + 1, Math.floor(((r + 1) * height) / rows));
-    for (let c = 0; c < cols; c++) {
-      const x0 = Math.floor((c * width) / cols);
-      const x1 = Math.max(x0 + 1, Math.floor(((c + 1) * width) / cols));
-      let sum = 0;
-      let count = 0;
-      for (let y = y0; y < y1; y++) {
-        for (let x = x0; x < x1; x++) {
-          sum += gray[y * width + x];
-          count++;
-        }
-      }
-      grid[r * cols + c] = count > 0 ? sum / count : 0;
+// 统计原生 1:1 灰度标题栏中的文字墨迹像素数（以众数为背景灰度，统计 |px - bg| >= 20 的像素）。
+export function countHeaderInkPixels(buf: Buffer): { bg: number; inkPixels: number; totalPixels: number } {
+  const totalPixels = buf.length;
+  if (totalPixels === 0) return { bg: 0, inkPixels: 0, totalPixels: 0 };
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < totalPixels; i++) hist[buf[i]]++;
+  let bg = 0;
+  let maxCount = 0;
+  for (let v = 0; v < 256; v++) {
+    if (hist[v] > maxCount) {
+      maxCount = hist[v];
+      bg = v;
     }
   }
-  let hex = '';
-  for (let r = 0; r < rows; r++) {
-    let byte = 0;
-    for (let c = 0; c < 8; c++) {
-      if (grid[r * cols + c] < grid[r * cols + c + 1]) {
-        byte |= 1 << (7 - c);
-      }
-    }
-    hex += byte.toString(16).padStart(2, '0');
+  let inkPixels = 0;
+  for (let i = 0; i < totalPixels; i++) {
+    if (Math.abs(buf[i] - bg) >= HEADER_INK_DELTA) inkPixels++;
   }
-  return hex;
+  return { bg, inkPixels, totalPixels };
 }
 
-export function hexHammingDistance(a: string, b: string): number {
-  if (a.length !== b.length) return Number.MAX_SAFE_INTEGER;
-  let dist = 0;
-  for (let i = 0; i < a.length; i += 2) {
-    let x = parseInt(a.slice(i, i + 2), 16) ^ parseInt(b.slice(i, i + 2), 16);
-    while (x) {
-      dist += x & 1;
-      x >>>= 1;
-    }
-  }
-  return dist;
-}
-
-function compareGrayRegion(
-  aGray: Buffer,
-  bGray: Buffer,
-  aDhash: string,
-  bDhash: string,
-): RegionCheckMetrics {
-  const len = Math.min(aGray.length, bGray.length);
-  if (len !== FINGERPRINT_RAW_BYTES) {
-    return { match: false, hammingDistance: 64, meanAbsDiff: 255, changedPixelRatio: 1 };
-  }
-  let absSum = 0;
-  let changed = 0;
-  for (let i = 0; i < len; i++) {
-    const diff = Math.abs(aGray[i] - bGray[i]);
-    absSum += diff;
-    if (diff >= 20) changed++;
-  }
-  const meanAbsDiff = Number((absSum / len).toFixed(2));
-  const changedPixelRatio = Number((changed / len).toFixed(4));
-  const hammingDistance = hexHammingDistance(aDhash, bDhash);
-  const match = hammingDistance <= 6 && meanAbsDiff <= 6.0 && changedPixelRatio <= 0.04;
-  return { match, hammingDistance, meanAbsDiff, changedPixelRatio };
-}
-
-// 对比草稿期与确认期的会话指纹：先比窗口/屏幕几何，再分别比标题栏与输入区 64x16 灰度像素 + dHash。
-// 阈值取保守值（防串窗与防草稿被篡改优先）：dHash 汉明距离 <= 6、像素平均绝对差 <= 6.0、显著变化像素比例(|Δ|>=20) <= 4%。
+// 对比草稿期与确认期的会话指纹：
+// 1. 窗口/屏幕/裁剪区几何必须完全一致（否则 window_geometry_mismatch）；
+// 2. HEADER 原生 1:1 灰度图逐像素精确比对，零容差（diffPixels === 0，差 1 像素即 session_fingerprint_mismatch）；
+// 3. EDITOR 完全解耦：默认 editorMaxDiffPixels=null（仅输出诊断指标，不预设拦截阈值）；显式传入阈值后超限才拒（editor_fingerprint_mismatch）。
 export function compareSessionFingerprints(
   draft: SessionFingerprint,
   live: SessionFingerprint,
+  opts: { editorMaxDiffPixels?: number | null } = {},
 ): FingerprintComparison {
-  const failMetric: RegionCheckMetrics = { match: false, hammingDistance: 64, meanAbsDiff: 255, changedPixelRatio: 1 };
+  const maxEditorDiff = opts.editorMaxDiffPixels ?? null;
+  const failHeader: HeaderCheckMetrics = { match: false, diffPixels: -1, totalPixels: draft.headerGray.length, meanAbsDiff: 255 };
+  const failEditor: EditorCheckMetrics = {
+    enforced: maxEditorDiff !== null,
+    match: maxEditorDiff === null,
+    diffPixels: -1,
+    changedPixels20: -1,
+    totalPixels: draft.editorGray.length,
+    meanAbsDiff: 255,
+    changedPixelRatio: 1,
+    maxDiffPixels: maxEditorDiff,
+  };
+
   if (
     draft.displayWidth !== live.displayWidth ||
     draft.displayHeight !== live.displayHeight ||
@@ -2264,28 +2234,86 @@ export function compareSessionFingerprints(
       match: false,
       reason: 'window_geometry_mismatch',
       detail: '显示分辨率或微信主窗口几何信息已发生变化',
-      headerCheck: failMetric,
-      editorCheck: failMetric,
+      headerCheck: failHeader,
+      editorCheck: failEditor,
     };
   }
 
-  const headerCheck = compareGrayRegion(draft.headerGray, live.headerGray, draft.headerDhash, live.headerDhash);
-  const editorCheck = compareGrayRegion(draft.editorGray, live.editorGray, draft.editorDhash, live.editorDhash);
+  // Exact pixel-by-pixel HEADER comparison (zero tolerance: diffPixels === 0).
+  const expectedHeaderLen = draft.headerRegion.width * draft.headerRegion.height;
+  let headerCheck: HeaderCheckMetrics;
+  if (draft.headerGray.length !== expectedHeaderLen || live.headerGray.length !== expectedHeaderLen) {
+    headerCheck = { match: false, diffPixels: expectedHeaderLen, totalPixels: expectedHeaderLen, meanAbsDiff: 255 };
+  } else {
+    let diffPixels = 0;
+    let absSum = 0;
+    for (let i = 0; i < expectedHeaderLen; i++) {
+      const d = Math.abs(draft.headerGray[i] - live.headerGray[i]);
+      if (d !== 0) diffPixels++;
+      absSum += d;
+    }
+    headerCheck = {
+      match: diffPixels === 0,
+      diffPixels,
+      totalPixels: expectedHeaderLen,
+      meanAbsDiff: Number((absSum / expectedHeaderLen).toFixed(4)),
+    };
+  }
+
+  // Decoupled EDITOR comparison (diagnostic-only when maxEditorDiff === null).
+  const expectedEditorLen = draft.headerRegion.width * EDITOR_FINGERPRINT_HEIGHT;
+  let editorCheck: EditorCheckMetrics;
+  if (draft.editorGray.length !== expectedEditorLen || live.editorGray.length !== expectedEditorLen) {
+    editorCheck = {
+      enforced: maxEditorDiff !== null,
+      match: maxEditorDiff === null,
+      diffPixels: expectedEditorLen,
+      changedPixels20: expectedEditorLen,
+      totalPixels: expectedEditorLen,
+      meanAbsDiff: 255,
+      changedPixelRatio: 1,
+      maxDiffPixels: maxEditorDiff,
+    };
+  } else {
+    let diffPixels = 0;
+    let changedPixels20 = 0;
+    let absSum = 0;
+    for (let i = 0; i < expectedEditorLen; i++) {
+      const d = Math.abs(draft.editorGray[i] - live.editorGray[i]);
+      if (d !== 0) diffPixels++;
+      if (d >= HEADER_INK_DELTA) changedPixels20++;
+      absSum += d;
+    }
+    const meanAbsDiff = Number((absSum / expectedEditorLen).toFixed(4));
+    const changedPixelRatio = Number((changedPixels20 / expectedEditorLen).toFixed(4));
+    const enforced = maxEditorDiff !== null;
+    const match = !enforced || changedPixels20 <= maxEditorDiff;
+    editorCheck = {
+      enforced,
+      match,
+      diffPixels,
+      changedPixels20,
+      totalPixels: expectedEditorLen,
+      meanAbsDiff,
+      changedPixelRatio,
+      maxDiffPixels: maxEditorDiff,
+    };
+  }
 
   if (!headerCheck.match) {
     return {
       match: false,
       reason: 'session_fingerprint_mismatch',
-      detail: `会话标题栏像素变化超出阈值（hamming=${headerCheck.hammingDistance}, meanAbsDiff=${headerCheck.meanAbsDiff}, changedRatio=${headerCheck.changedPixelRatio}）`,
+      detail: `会话标题栏原生 1:1 像素发生变化（diff_pixels=${headerCheck.diffPixels}/${headerCheck.totalPixels}）`,
       headerCheck,
       editorCheck,
     };
   }
-  if (!editorCheck.match) {
+  if (editorCheck.enforced && !editorCheck.match) {
     return {
       match: false,
       reason: 'editor_fingerprint_mismatch',
-      detail: `输入编辑区像素变化超出阈值（hamming=${editorCheck.hammingDistance}, meanAbsDiff=${editorCheck.meanAbsDiff}, changedRatio=${editorCheck.changedPixelRatio}）`,
+      detail: `输入编辑区像素变化超出阈值（changed_pixels_20=${editorCheck.changedPixels20} > ${editorCheck.maxDiffPixels}）`,
       headerCheck,
       editorCheck,
     };
@@ -2293,13 +2321,14 @@ export function compareSessionFingerprints(
   return { match: true, headerCheck, editorCheck };
 }
 
-// 单帧原子采集：关闭鼠标绘制（-draw_mouse 0），单次 ffmpeg x11grab 切出 header(64x16) 与 editor(64x16) 纵向拼接为 64x32 (2048 B) 原始灰度流。
+// 单帧原子采集（~187ms）：关闭鼠标绘制（-draw_mouse 0），单次 ffmpeg x11grab 切出
+// 原生 1:1 header (hw x hh，不缩放) 与 editor (hw x 32) 纵向拼接为 hw x (hh + 32) 原始灰度流。
 const FINGERPRINT_CAPTURE_SCRIPT = [
   'set -eu',
   'display="$1"; sw="$2"; sh="$3"; hx="$4"; hy="$5"; hw="$6"; hh="$7"; ex="$8"; ey="$9"; ew="${10}"; eh="${11}"',
   'export DISPLAY="$display"',
   'command -v ffmpeg >/dev/null 2>&1 || { echo "ffmpeg not installed in instance image" >&2; exit 127; }',
-  `fc="[0:v]split=2[h][e];[h]crop=\${hw}:\${hh}:\${hx}:\${hy},scale=${FINGERPRINT_GRID_W}:${FINGERPRINT_GRID_H},format=gray[hs];[e]crop=\${ew}:\${eh}:\${ex}:\${ey},scale=${FINGERPRINT_GRID_W}:${FINGERPRINT_GRID_H},format=gray[es];[hs][es]vstack=inputs=2[out]"`,
+  `fc="[0:v]split=2[h][e];[h]crop=\${hw}:\${hh}:\${hx}:\${hy},format=gray[hs];[e]crop=\${ew}:\${eh}:\${ex}:\${ey},scale=\${hw}:${EDITOR_FINGERPRINT_HEIGHT},format=gray[es];[hs][es]vstack=inputs=2[out]"`,
   'exec ffmpeg -loglevel error -draw_mouse 0 -f x11grab -video_size "${sw}x${sh}" -i "${display}+0,0" -vframes 1 -filter_complex "$fc" -map "[out]" -f rawvideo -pix_fmt gray -',
 ].join('\n');
 
@@ -2324,6 +2353,9 @@ export async function captureSessionFingerprint(inst: Instance): Promise<Session
   if (!/^:[0-9]+(\.[0-9]+)?$/.test(winInfo.display)) {
     throw new Error('实例 DISPLAY 名称非法');
   }
+  const expectedHeaderBytes = headerRegion.width * headerRegion.height;
+  const expectedEditorBytes = headerRegion.width * EDITOR_FINGERPRINT_HEIGHT;
+  const expectedTotalBytes = expectedHeaderBytes + expectedEditorBytes;
   const combined = await execCaptureBuffer(
     inst,
     [
@@ -2345,15 +2377,14 @@ export async function captureSessionFingerprint(inst: Instance): Promise<Session
     ],
     'abc',
     8000,
-    8192,
+    expectedTotalBytes + 4096,
   );
-  if (combined.length !== FINGERPRINT_COMBINED_BYTES) {
-    throw new Error(`会话指纹原始字节数异常：期望 ${FINGERPRINT_COMBINED_BYTES}，实际 ${combined.length}`);
+  if (combined.length !== expectedTotalBytes) {
+    throw new Error(`会话指纹原始字节数异常：期望 ${expectedTotalBytes}，实际 ${combined.length}`);
   }
-  const headerGray = Buffer.from(combined.subarray(0, FINGERPRINT_RAW_BYTES));
-  const editorGray = Buffer.from(combined.subarray(FINGERPRINT_RAW_BYTES, FINGERPRINT_COMBINED_BYTES));
-  const headerDhash = computeGrayscaleDHash(headerGray);
-  const editorDhash = computeGrayscaleDHash(editorGray);
+  const headerGray = Buffer.from(combined.subarray(0, expectedHeaderBytes));
+  const editorGray = Buffer.from(combined.subarray(expectedHeaderBytes, expectedTotalBytes));
+  const { bg: headerBg, inkPixels: headerInkPixels } = countHeaderInkPixels(headerGray);
   const digest = createHash('sha256')
     .update(headerGray)
     .update(editorGray)
@@ -2370,8 +2401,8 @@ export async function captureSessionFingerprint(inst: Instance): Promise<Session
     editorRegion,
     headerGray,
     editorGray,
-    headerDhash,
-    editorDhash,
+    headerInkPixels,
+    headerBg,
     digest,
   };
 }

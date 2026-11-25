@@ -17,10 +17,11 @@ import {
   collectDemuxedStream,
   compareSessionFingerprints,
   computeEditorRegion,
-  computeGrayscaleDHash,
   computeHeaderRegion,
-  FINGERPRINT_RAW_BYTES,
+  countHeaderInkPixels,
+  EDITOR_FINGERPRINT_HEIGHT,
   isInSendButtonZone,
+  MIN_HEADER_INK_PIXELS,
   parsePngDimensions,
   parseWechatWindowInfo,
   type ClickOptions,
@@ -720,12 +721,12 @@ test('real panel boot: /mcp enforces auth/host/origin/method and serves initiali
   });
 });
 
-// ---------- Phase 2: Controlled Write Tools & Session Fingerprint Tests ----------
+// ---------- Phase 2: Controlled Write Tools & Native 1:1 Header Fingerprint Tests ----------
 
-function makeGrayBitmap(fill = 240, accentStart = 0, accentLen = 0, accentVal = 30): Buffer {
-  const buf = Buffer.alloc(FINGERPRINT_RAW_BYTES, fill);
-  for (let i = accentStart; i < Math.min(buf.length, accentStart + accentLen); i++) {
-    buf[i] = accentVal;
+function makeGrayBitmap(size: number, fill = 237, inkOffset = 0, inkCount = 0, inkVal = 30): Buffer {
+  const buf = Buffer.alloc(size, fill);
+  for (let i = inkOffset; i < Math.min(buf.length, inkOffset + inkCount); i++) {
+    buf[i] = inkVal;
   }
   return buf;
 }
@@ -750,8 +751,11 @@ function makeTestFingerprint(opts: {
   };
   const headerRegion = computeHeaderRegion(wechatWindow, displayWidth, displayHeight)!;
   const editorRegion = computeEditorRegion(wechatWindow, displayWidth, displayHeight)!;
-  const headerGray = opts.headerGray ?? makeGrayBitmap(240, 10, 80, 30);
-  const editorGray = opts.editorGray ?? makeGrayBitmap(250, 20, 60, 40);
+  const headerSize = headerRegion.width * headerRegion.height; // 280*44 = 12320
+  const editorSize = headerRegion.width * EDITOR_FINGERPRINT_HEIGHT; // 280*32 = 8960
+  const headerGray = opts.headerGray ?? makeGrayBitmap(headerSize, 237, 200, 240, 25);
+  const editorGray = opts.editorGray ?? makeGrayBitmap(editorSize, 250, 100, 120, 40);
+  const { bg: headerBg, inkPixels: headerInkPixels } = countHeaderInkPixels(headerGray);
   return {
     displayWidth,
     displayHeight,
@@ -760,16 +764,16 @@ function makeTestFingerprint(opts: {
     editorRegion,
     headerGray,
     editorGray,
-    headerDhash: computeGrayscaleDHash(headerGray),
-    editorDhash: computeGrayscaleDHash(editorGray),
+    headerInkPixels,
+    headerBg,
     digest: '0123456789abcdef',
   };
 }
 
-test('computeHeaderRegion, computeEditorRegion, isInSendButtonZone, and compareSessionFingerprints', () => {
+test('computeHeaderRegion, countHeaderInkPixels, exact 1:1 header match (0px tolerance), and decoupled editor', () => {
   const win = { id: '1', x: 0, y: 0, width: 1836, height: 884, title: '微信' };
   const headerRegion = computeHeaderRegion(win, 1836, 884);
-  assert.deepEqual(headerRegion, { x: 355, y: 6, width: 520, height: 58 });
+  assert.deepEqual(headerRegion, { x: 355, y: 12, width: 280, height: 44 });
   const editorRegion = computeEditorRegion(win, 1836, 884);
   assert.deepEqual(editorRegion, { x: 355, y: 742, width: 1461, height: 82 });
   assert.equal(computeHeaderRegion({ ...win, width: 400, height: 200 }, 1836, 884), null);
@@ -782,34 +786,73 @@ test('computeHeaderRegion, computeEditorRegion, isInSendButtonZone, and compareS
   assert.equal(isInSendButtonZone(1750, 811, win), false);
   assert.equal(isInSendButtonZone(1750, 850, null), false);
 
-  const fpA = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 16, 60, 25), editorGray: makeGrayBitmap(250, 20, 60, 40) });
-  const fpSame = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 16, 60, 25), editorGray: makeGrayBitmap(250, 20, 60, 40) });
+  // Blank header ink detection
+  const headerBytes = 280 * 44;
+  const blankBuf = makeGrayBitmap(headerBytes, 237, 0, 0);
+  assert.deepEqual(countHeaderInkPixels(blankBuf), { bg: 237, inkPixels: 0, totalPixels: headerBytes });
+  const sparseBuf = makeGrayBitmap(headerBytes, 237, 100, MIN_HEADER_INK_PIXELS - 1, 20);
+  assert.equal(countHeaderInkPixels(sparseBuf).inkPixels, MIN_HEADER_INK_PIXELS - 1);
+
+  // 4. Identical header MUST match (diff_pixels === 0)
+  const fpA = makeTestFingerprint({
+    headerGray: makeGrayBitmap(headerBytes, 237, 300, 240, 20), // simulated 2-char Chinese title A
+  });
+  const fpSame = makeTestFingerprint({
+    headerGray: Buffer.from(fpA.headerGray),
+    editorGray: Buffer.from(fpA.editorGray),
+  });
   const sameCmp = compareSessionFingerprints(fpA, fpSame);
   assert.equal(sameCmp.match, true);
   assert.equal(sameCmp.headerCheck.match, true);
+  assert.equal(sameCmp.headerCheck.diffPixels, 0);
+  assert.equal(sameCmp.editorCheck.enforced, false);
   assert.equal(sameCmp.editorCheck.match, true);
 
-  // Small caret blink in editor (e.g. 6 pixels out of 1024 = 0.59% changed) still matches
-  const caretBlink = Buffer.from(fpA.editorGray);
-  for (let i = 0; i < 6; i++) caretBlink[300 + i] = 20;
-  const fpCaret = makeTestFingerprint({ headerGray: fpA.headerGray, editorGray: caretBlink });
-  const caretCmp = compareSessionFingerprints(fpA, fpCaret);
-  assert.equal(caretCmp.match, true);
-  assert.equal(caretCmp.editorCheck.match, true);
+  // 3. Single 1-pixel difference in header MUST be rejected (diff_pixels: 1 -> session_fingerprint_mismatch)
+  const onePxGray = Buffer.from(fpA.headerGray);
+  onePxGray[500] = onePxGray[500] === 237 ? 236 : 237;
+  const fpOnePx = makeTestFingerprint({ headerGray: onePxGray, editorGray: fpA.editorGray });
+  const onePxCmp = compareSessionFingerprints(fpA, fpOnePx);
+  assert.equal(onePxCmp.match, false);
+  assert.equal(onePxCmp.reason, 'session_fingerprint_mismatch');
+  assert.equal(onePxCmp.headerCheck.diffPixels, 1);
 
-  // Contact name changed -> session_fingerprint_mismatch
-  const fpOtherChat = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 180, 120, 20), editorGray: fpA.editorGray });
-  const diffChat = compareSessionFingerprints(fpA, fpOtherChat);
-  assert.equal(diffChat.match, false);
-  assert.equal(diffChat.reason, 'session_fingerprint_mismatch');
+  // 1. Short 2-char title cross-chat MUST mismatch (diff_pixels > 0 -> session_fingerprint_mismatch)
+  const fpShortB = makeTestFingerprint({
+    headerGray: makeGrayBitmap(headerBytes, 237, 560, 240, 20), // distinct 2-char Chinese title B
+    editorGray: fpA.editorGray,
+  });
+  const crossCmp = compareSessionFingerprints(fpA, fpShortB);
+  assert.equal(crossCmp.match, false);
+  assert.equal(crossCmp.reason, 'session_fingerprint_mismatch');
+  assert.equal(crossCmp.headerCheck.diffPixels, 480);
 
-  // Editor text changed while header stayed identical -> editor_fingerprint_mismatch
-  const fpEditedDraft = makeTestFingerprint({ headerGray: fpA.headerGray, editorGray: makeGrayBitmap(250, 120, 150, 20) });
-  const diffEditor = compareSessionFingerprints(fpA, fpEditedDraft);
-  assert.equal(diffEditor.match, false);
-  assert.equal(diffEditor.reason, 'editor_fingerprint_mismatch');
-  assert.equal(diffEditor.headerCheck.match, true);
-  assert.equal(diffEditor.editorCheck.match, false);
+  // 5. Decoupled editor: default (editorMaxDiffPixels=null) is diagnostic-only and does NOT reject
+  const fpEditedEditor = makeTestFingerprint({
+    headerGray: Buffer.from(fpA.headerGray),
+    editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 500, 300, 15),
+  });
+  const diagCmp = compareSessionFingerprints(fpA, fpEditedEditor);
+  assert.equal(diagCmp.match, true);
+  assert.equal(diagCmp.headerCheck.diffPixels, 0);
+  assert.equal(diagCmp.editorCheck.enforced, false);
+  assert.equal(diagCmp.editorCheck.maxDiffPixels, null);
+  assert.ok(diagCmp.editorCheck.changedPixels20 > 100);
+
+  // Enforced editor mode: rejects when changedPixels20 > threshold, allows tiny caret blink <= threshold
+  const enforcedFail = compareSessionFingerprints(fpA, fpEditedEditor, { editorMaxDiffPixels: 20 });
+  assert.equal(enforcedFail.match, false);
+  assert.equal(enforcedFail.reason, 'editor_fingerprint_mismatch');
+  assert.equal(enforcedFail.editorCheck.enforced, true);
+  assert.equal(enforcedFail.editorCheck.match, false);
+
+  const caretBlinkEditor = Buffer.from(fpA.editorGray);
+  for (let i = 0; i < 8; i++) caretBlinkEditor[2000 + i] = 20;
+  const fpCaret = makeTestFingerprint({ headerGray: Buffer.from(fpA.headerGray), editorGray: caretBlinkEditor });
+  const enforcedCaretOk = compareSessionFingerprints(fpA, fpCaret, { editorMaxDiffPixels: 20 });
+  assert.equal(enforcedCaretOk.match, true);
+  assert.equal(enforcedCaretOk.editorCheck.enforced, true);
+  assert.equal(enforcedCaretOk.editorCheck.changedPixels20, 8);
 
   // Window geometry resized -> window_geometry_mismatch
   const fpResized = makeTestFingerprint({ displayWidth: 1600, displayHeight: 900, winW: 1600, winH: 900 });
@@ -1040,8 +1083,7 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     assert.equal(draftMeta.text_length, SECRET_MSG.length);
     assert.equal(draftMeta.ttl_sec, 60);
     assert.ok(draftMeta.draft_id);
-    assert.ok(draftMeta.fingerprint_summary.header_dhash);
-    assert.ok(draftMeta.fingerprint_summary.editor_dhash);
+    assert.equal(draftMeta.fingerprint_summary.header_ink_pixels, 240);
     assert.equal(typed.length, 1);
     assert.deepEqual(typed[0].opts, { focusChat: true, clearFirst: true, send: false });
 
@@ -1052,8 +1094,24 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     const confirmOkBody = JSON.parse(confirmOk.result.content[0].text);
     assert.equal(confirmOkBody.sent, true);
     assert.equal(confirmOkBody.header_check.match, true);
+    assert.equal(confirmOkBody.header_check.diff_pixels, 0);
+    assert.equal(confirmOkBody.editor_check.enforced, false);
     assert.equal(confirmOkBody.editor_check.match, true);
     assert.deepEqual(keysSent, ['Return']);
+
+    // 6a. Blank header rejected on woc_draft_reply with header_blank (no draft_id issued!)
+    liveFingerprint = makeTestFingerprint({ headerGray: makeGrayBitmap(280 * 44, 237, 0, 0) });
+    const blankDraftRes = await rpc(1301, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'blank-header-test' },
+    });
+    const blankDraftBody = JSON.parse(blankDraftRes.result.content[0].text);
+    assert.equal(blankDraftBody.ok, false);
+    assert.equal(blankDraftBody.error, 'header_blank');
+    assert.equal(blankDraftBody.header_ink_pixels, 0);
+    assert.equal(blankDraftBody.min_header_ink_pixels, MIN_HEADER_INK_PIXELS);
+    assert.equal(blankDraftBody.draft_id, undefined);
+    liveFingerprint = makeTestFingerprint();
 
     // Replay same draft_id -> draft_not_found + input_may_have_residual_draft: true
     const replay = await rpc(14, 'tools/call', {
@@ -1119,13 +1177,16 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     });
     assert.equal(JSON.parse(retryAfterWrong.result.content[0].text).error, 'draft_not_found');
 
-    // 9. Session header fingerprint mismatch -> aborted, consumed, residual flag + metrics
+    // 9. Single 1-pixel header change -> session_fingerprint_mismatch (zero tolerance!)
+    liveFingerprint = makeTestFingerprint();
     const draftFpRes = await rpc(20, 'tools/call', {
       name: 'woc_draft_reply',
       arguments: { instance_id: RUNNING_INST.id, text: 'fp-check' },
     });
     const fpId = JSON.parse(draftFpRes.result.content[1].text).draft_id;
-    liveFingerprint = makeTestFingerprint({ headerGray: makeGrayBitmap(240, 200, 140, 15) });
+    const onePxHeader = Buffer.from(liveFingerprint.headerGray);
+    onePxHeader[123] = onePxHeader[123] === 237 ? 236 : 237;
+    liveFingerprint = makeTestFingerprint({ headerGray: onePxHeader, editorGray: liveFingerprint.editorGray });
     fakeNow += 5_000;
     const confirmFpFail = JSON.parse((await rpc(21, 'tools/call', {
       name: 'woc_confirm_send',
@@ -1134,26 +1195,43 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     assert.equal(confirmFpFail.error, 'session_fingerprint_mismatch');
     assert.equal(confirmFpFail.input_may_have_residual_draft, true);
     assert.equal(confirmFpFail.header_check.match, false);
+    assert.equal(confirmFpFail.header_check.diff_pixels, 1);
     assert.equal(keysSent.length, 1);
 
-    // 9b. Editor fingerprint mismatch while header matches -> editor_fingerprint_mismatch
+    // 9b. Decoupled editor diagnostic mode (default editorMaxDiffPixels=null):
+    // editor diff is reported in editor_check (enforced: false) without blocking when header matches 100%
     liveFingerprint = makeTestFingerprint();
     const draftEdRes = await rpc(2101, 'tools/call', {
       name: 'woc_draft_reply',
-      arguments: { instance_id: RUNNING_INST.id, text: 'editor-check' },
+      arguments: { instance_id: RUNNING_INST.id, text: 'editor-diag-check' },
     });
     const edId = JSON.parse(draftEdRes.result.content[1].text).draft_id;
-    liveFingerprint = makeTestFingerprint({ editorGray: makeGrayBitmap(250, 200, 150, 15) });
-    fakeNow += 5_000;
-    const confirmEdFail = JSON.parse((await rpc(2102, 'tools/call', {
+    liveFingerprint = makeTestFingerprint({
+      headerGray: Buffer.from(liveFingerprint.headerGray),
+      editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 200, 150, 15),
+    });
+    fakeNow += 61_000;
+    // Create a fresh draft to confirm editor diagnostic pass (within 60s TTL)
+    liveFingerprint = makeTestFingerprint();
+    const draftEdRes2 = await rpc(2102, 'tools/call', {
+      name: 'woc_draft_reply',
+      arguments: { instance_id: RUNNING_INST.id, text: 'editor-diag-ok' },
+    });
+    const edId2 = JSON.parse(draftEdRes2.result.content[1].text).draft_id;
+    liveFingerprint = makeTestFingerprint({
+      headerGray: Buffer.from(liveFingerprint.headerGray),
+      editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 400, 180, 15),
+    });
+    const confirmEdDiag = JSON.parse((await rpc(2103, 'tools/call', {
       name: 'woc_confirm_send',
-      arguments: { instance_id: RUNNING_INST.id, draft_id: edId },
+      arguments: { instance_id: RUNNING_INST.id, draft_id: edId2 },
     })).result.content[0].text);
-    assert.equal(confirmEdFail.error, 'editor_fingerprint_mismatch');
-    assert.equal(confirmEdFail.input_may_have_residual_draft, true);
-    assert.equal(confirmEdFail.header_check.match, true);
-    assert.equal(confirmEdFail.editor_check.match, false);
-    assert.equal(keysSent.length, 1);
+    assert.equal(confirmEdDiag.sent, true);
+    assert.equal(confirmEdDiag.header_check.diff_pixels, 0);
+    assert.equal(confirmEdDiag.editor_check.enforced, false);
+    assert.ok(confirmEdDiag.editor_check.changed_pixels_20 > 0);
+    assert.equal(keysSent.length, 2);
+    void edId;
 
     // 10. Window geometry mismatch -> aborted & consumed
     liveFingerprint = makeTestFingerprint();
@@ -1171,7 +1249,7 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     })).result.content[0].text);
     assert.equal(confirmGeoFail.error, 'window_geometry_mismatch');
     assert.equal(confirmGeoFail.input_may_have_residual_draft, true);
-    assert.equal(keysSent.length, 1);
+    assert.equal(keysSent.length, 2);
 
     // 11. Send error -> send_uncertain_no_retry, NO auto-retry, draft consumed, residual flag
     liveFingerprint = makeTestFingerprint();
@@ -1190,7 +1268,7 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 12 tools with exact annotations, click/scroll, 
     const confirmErrBody = JSON.parse(confirmErr.result.content[0].text);
     assert.equal(confirmErrBody.error, 'send_uncertain_no_retry');
     assert.equal(confirmErrBody.input_may_have_residual_draft, true);
-    assert.equal(keysSent.length, 2); // called strictly once for this send, zero auto-retry!
+    assert.equal(keysSent.length, 3); // called strictly once for this send, zero auto-retry!
     assert.equal(JSON.parse((await rpc(28, 'tools/call', { name: 'woc_confirm_send', arguments: { instance_id: RUNNING_INST.id, draft_id: errId2 } })).result.content[0].text).error, 'draft_not_found');
     keyThrows = false;
 
@@ -1259,6 +1337,48 @@ test('Phase 2 general write rate limiter enforces per-minute window', async () =
     // Advance past window -> allowed again
     fakeNow += 60_001;
     assert.equal((await callClick(4)).ok, true);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('Phase 2 enforced editorMaxDiffPixels rejects editor changes while allowing small caret blink', async () => {
+  let liveFp = makeTestFingerprint();
+  const keysSent: string[] = [];
+  const srv = await buildMockMcpServer({
+    allowWrite: true,
+    editorMaxDiffPixels: 15,
+    activeVncViewerCount: () => 0,
+    getControlLock: () => ({ active: false, holder: null, ageMs: null }),
+    typeInInstance: async () => {},
+    keyInInstance: async (_inst, key) => {
+      keysSent.push(key);
+    },
+    captureSessionFingerprint: async () => liveFp,
+  });
+  const callTool = async (id: number, name: string, args: Record<string, unknown>) => {
+    const res = await rawHttp(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }),
+    });
+    assert.equal(res.status, 200);
+    return JSON.parse(res.body);
+  };
+  try {
+    // Draft -> major editor change -> rejected with editor_fingerprint_mismatch
+    const d1 = JSON.parse((await callTool(1, 'woc_draft_reply', { instance_id: RUNNING_INST.id, text: 'enforced-1' })).result.content[1].text).draft_id;
+    liveFp = makeTestFingerprint({
+      headerGray: Buffer.from(liveFp.headerGray),
+      editorGray: makeGrayBitmap(280 * EDITOR_FINGERPRINT_HEIGHT, 250, 500, 200, 15),
+    });
+    const r1 = JSON.parse((await callTool(2, 'woc_confirm_send', { instance_id: RUNNING_INST.id, draft_id: d1 })).result.content[0].text);
+    assert.equal(r1.error, 'editor_fingerprint_mismatch');
+    assert.equal(r1.input_may_have_residual_draft, true);
+    assert.equal(r1.header_check.diff_pixels, 0);
+    assert.equal(r1.editor_check.enforced, true);
+    assert.equal(r1.editor_check.match, false);
+    assert.equal(keysSent.length, 0);
   } finally {
     await srv.close();
   }

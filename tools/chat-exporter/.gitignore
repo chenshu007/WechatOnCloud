@@ -1,0 +1,7 @@
+# Never commit extracted keys, API credentials, or exported plaintext chats
+secrets/keys.json
+secrets/.env
+output/
+__pycache__/
+*.pyc
+.DS_Store

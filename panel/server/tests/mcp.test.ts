@@ -454,11 +454,11 @@ test('MCP end-to-end POST /mcp: initialize, tools/list, and all 7 read-only tool
     );
     assert.equal(init.result.serverInfo.name, 'woc-panel-mcp');
 
-    // 2. tools/list — exact 7 read-only tools
+    // 2. tools/list — exact 8 read-only tools
     const list = await rpc(2, 'tools/list');
     const names = list.result.tools.map((t: any) => t.name);
     assert.deepEqual(names, MCP_TOOLS.map((t) => t.name));
-    assert.equal(names.length, 7);
+    assert.equal(names.length, 8);
     for (const tool of list.result.tools) {
       assert.equal(tool.annotations?.readOnlyHint, true);
       assert.equal(tool.annotations?.destructiveHint, false);
@@ -704,7 +704,7 @@ test('real panel boot: /mcp enforces auth/host/origin/method and serves initiali
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
     });
     assert.equal(listRes.status, 200);
-    assert.equal(JSON.parse(listRes.body).result.tools.length, 7);
+    assert.equal(JSON.parse(listRes.body).result.tools.length, 8);
 
     // woc_health degrades gracefully when Docker socket is unreachable
     const healthRes = await rawHttp(`${url}/mcp`, {
@@ -922,7 +922,7 @@ test('Phase 2 feature gate: MCP_ALLOW_WRITE unset/0 exposes only 7 read-only too
   };
   try {
     const list = await rpc(1, 'tools/list');
-    assert.equal(list.result.tools.length, 7);
+    assert.equal(list.result.tools.length, 8);
     for (const writeTool of MCP_WRITE_TOOLS) {
       const res = await rpc(2, 'tools/call', { name: writeTool.name, arguments: {} });
       assert.equal(res.result.isError, true);
@@ -1006,9 +1006,9 @@ test('Phase 2 MCP_ALLOW_WRITE=1: 13 tools with exact annotations, click/scroll, 
   };
 
   try {
-    // 1. tools/list returns exact 14 tools (7 read-only + woc_session_header + 6 write) with expected annotations
+    // 1. tools/list returns exact 15 tools (8 read-only + woc_session_header + 6 write) with expected annotations
     const list = await rpc(1, 'tools/list');
-    assert.equal(list.result.tools.length, 14);
+    assert.equal(list.result.tools.length, 15);
     const byName = new Map<string, any>(list.result.tools.map((t: any) => [t.name, t]));
     assert.equal(byName.get('woc_session_header').annotations.readOnlyHint, true);
     assert.equal(byName.get('woc_session_header').annotations.destructiveHint, false);
@@ -1857,7 +1857,7 @@ test('real panel boot: MCP_ALLOW_WRITE=1 exposes 14 tools including woc_session_
     assert.equal(listRes.status, 200);
     assert.equal(listRes.headers['cache-control'], 'no-store, max-age=0');
     const tools = JSON.parse(listRes.body).result.tools;
-    assert.equal(tools.length, 14);
+    assert.equal(tools.length, 15);
     const confirmTool = tools.find((t: any) => t.name === 'woc_confirm_send');
     const discardTool = tools.find((t: any) => t.name === 'woc_discard_draft');
     const draftImageTool = tools.find((t: any) => t.name === 'woc_draft_image');
@@ -1993,6 +1993,46 @@ test('Phase 2 woc_draft_image: validates signature, pins header, pastes under lo
 
     // Privacy: base64 image data must never appear in audit logs
     assert.ok(logs.every((l) => !l.includes(PNG_1X1_B64.slice(0, 16))));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('woc_read_clipboard_image: returns full PNG image, handles stopped instance and empty clipboard', async () => {
+  const png = makeTestPng(320, 240);
+  let empty = false;
+  const srv = await buildMockMcpServer({
+    readClipboardImage: async () => {
+      if (empty) throw new Error('微信剪贴板中没有可读取的 PNG 图片');
+      return png;
+    },
+  });
+  const call = async (id: number, instance_id: string) => {
+    const res = await rawHttp(`${srv.url}/mcp`, {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'woc_read_clipboard_image', arguments: { instance_id } } }),
+    });
+    assert.equal(res.status, 200);
+    return JSON.parse(res.body);
+  };
+  try {
+    const ok = await call(1, RUNNING_INST.id);
+    assert.equal(ok.result.content[0].type, 'image');
+    assert.equal(ok.result.content[0].mimeType, 'image/png');
+    assert.equal(ok.result.content[0].data, png.toString('base64'));
+    const meta = JSON.parse(ok.result.content[1].text);
+    assert.equal(meta.ok, true);
+    assert.equal(meta.width, 320);
+    assert.equal(meta.height, 240);
+    assert.equal(meta.bytes, png.length);
+
+    const stopped = await call(2, STOPPED_INST.id);
+    assert.equal(JSON.parse(stopped.result.content[0].text).error, 'instance_stopped');
+
+    empty = true;
+    const noImg = await call(3, RUNNING_INST.id);
+    assert.equal(JSON.parse(noImg.result.content[0].text).error, 'no_clipboard_image');
   } finally {
     await srv.close();
   }
